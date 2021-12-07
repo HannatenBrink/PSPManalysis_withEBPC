@@ -1,0 +1,14 @@
+citHeader("To cite PSPManalysis in publications use:")
+
+citEntry(entry = "Manual",
+  title        = "PSPManalysis: A Software Package for Numerical Analysis of Physiologically Structured Population Models",
+  author       = "Andre M. de Roos",
+  organization = "Institute for Biodiversity and Ecosystem Dynamics, University of Amsterdam",
+  year         = "2018",
+  url          = "https://bitbucket.org/amderoos/PSPManalysis",
+
+  textVersion  =
+  paste("Andre M. de Roos (2017).",
+        "PSPManalysis: A Software Package for Numerical Analysis of Physiologically Structured Population Models",
+        "https://bitbucket.org/amderoos/PSPManalysis")
+)

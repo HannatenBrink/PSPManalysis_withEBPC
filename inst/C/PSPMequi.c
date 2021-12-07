@@ -1,0 +1,3226 @@
+/***
+  NAME
+    PSPMequi
+
+  PURPOSE
+    Generic, problem-independent specification for problems with
+    POPULATION_NR structured population, whose individuals are characterized
+    by I_STATE_DIM state variables, that interact with ENVIRON_DIM
+    environment variables. All problem-specific life-history functions are
+    specified in an include file
+
+    Copyright (C) 2015, Andre M. de Roos, University of Amsterdam
+
+    This file is part of the PSPManalysis software package.
+
+    PSPManalysis is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    any later version.
+
+    PSPManalysis is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with PSPManalysis. If not, see <http://www.gnu.org/licenses/>.
+
+    Last modification: AMdR - Aug 30, 2018
+***/
+
+#define PSPMEQUI                  1
+
+#if (!defined(RFUNCTIONS) || (RFUNCTIONS != 1))
+#define RFUNCTIONS                0
+#endif
+#if (!defined(MFUNCTIONS) || (MFUNCTIONS != 1))
+#define MFUNCTIONS                0
+#endif
+
+#if ((RFUNCTIONS == 1) || (MFUNCTIONS == 1))
+double                            parameter[PARAMETER_NR];
+const char                        *parameternames[PARAMETER_NR];
+int                               EnvironmentType[ENVIRON_DIM];
+#endif
+
+#include "globals.h"
+
+/*
+ *====================================================================================================================================
+ *  Import the population and environment dimension settings
+ *====================================================================================================================================
+ */
+
+#define Survival(p)               (exp(istate[p][IStateDim]))
+#define SetSurvival(p, s)         istate[p][IStateDim] = (((s) >= 0) && ((s) < exp(istate[p][IStateDim]))) ? (log(max((s), DBL_EPSILON))) : (istate[p][IStateDim])
+#define Birthrate(p)              (birthRatePntr[p])
+
+
+#if ((RFUNCTIONS != 1) && (MFUNCTIONS != 1))
+#if defined(PROBLEMHEADER)                                                          // Include header file
+#define HEADERNAME <PROBLEMHEADER>
+#include HEADERNAME
+#else
+#error No header file defined!
+#endif
+#endif
+
+#include "defaults.h"
+
+#if !defined(ENVIRON_DIM) || (ENVIRON_DIM < 1)
+#error Equilibrium analysis requires ENVIRON_DIM to be larger than 0
+#endif
+
+#if !defined(INTERACT_DIM) || (INTERACT_DIM < 1)
+#error INTERACT_DIM should be defined larger than 0
+#endif
+
+#if !defined(PARAMETER_NR) || (PARAMETER_NR < 3)
+#error PARAMETER_NR should be defined larger than 2
+#endif
+
+
+/*
+ *====================================================================================================================================
+ *  Definition of problem dimensions
+ *====================================================================================================================================
+ */
+
+#undef PULSED
+
+/*
+ *====================================================================================================================================
+ *  Definition of global variables and parameters
+ *====================================================================================================================================
+ */
+
+// Global dimension variables
+static int                        BirthStateNr[POPULATION_NR + 1];
+static int                        MaxPntDim;
+
+// These are the variables to solve for
+static double                     Evar[ENVIRON_DIM];
+static double                     EnvEquiCondition[ENVIRON_DIM];
+
+static int                        EnvTrivEqui[ENVIRON_DIM];
+static int                        EnvResIndex[ENVIRON_DIM];
+static int                        EnvPntIndex[ENVIRON_DIM];
+
+static double                     R0[POPULATION_NR + 1];
+static double                     Beq[POPULATION_NR + 1];
+static double                     InteractVars[POPULATION_NR + 1][INTERACT_DIM];
+
+static int                        PopTrivEqui[POPULATION_NR + 1];
+static int                        R0ResIndex[POPULATION_NR + 1];
+static int                        PopPntIndex[POPULATION_NR + 1];
+
+// Global variables to hold variables shared among routines
+static int                        LastMemAllocated = 0;
+static int                        pntdim;
+
+// Global pointers into the heap
+static double                     *RightEigenvecMem = NULL;
+
+#if (FULLSTATEOUTPUT > 0)
+static double                     *BirthStateMem = NULL;
+static double                     *PopDensMem    = NULL;
+static int                        *CohortsMem    = NULL;
+
+static double *CohortLimitMem = NULL;
+#if (FULLSTATEOUTPUT == 1)
+static double                     CohortMin[POPULATION_NR + 1], CohortMax[POPULATION_NR + 1];
+#endif
+#endif
+
+// Global flags to tailor execution
+static int                        TestRun       = 0;
+static int                        DoStateOutput = 0;
+static int                        SortIndex     = 0;
+static int                        ReportLevel   = 1;
+static int                        DoSingle    = 0;
+static int                        BPdetection = 1;
+static int                        LPdetection = 1;
+
+static int                        PIPEVOIndex = -1;
+
+static int                        PopEVOIndex[PARAMETER_NR];
+static int                        ParEVOIndex[PARAMETER_NR];
+static int                        ParEVODim    = 0;
+static int                        locateEvoPar = -1;
+
+static int                        essParsIndex[PARAMETER_NR];
+static int                        essPopsIndex[PARAMETER_NR];
+static int                        essParsDim;
+static int                        classifyESS = 0;
+
+// Global variables for other purposes
+static char                       progname[MAXPATHLEN];
+static double                     LogMinSurvival;
+static char                       ContinuationString[MAX_STR_LEN];
+static double                     initpnt[ENVIRON_DIM + POPULATION_NR + 1 + PARAMETER_NR];
+static double                     pntmin[ENVIRON_DIM + POPULATION_NR + 1 + PARAMETER_NR];
+static double                     pntmax[ENVIRON_DIM + POPULATION_NR + 1 + PARAMETER_NR];
+
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE) || defined(R_PACKAGE)
+static char                       parstring[MAX_STR_LEN];
+static char                       optstring[MAX_STR_LEN];
+static char                       curvestring[MAX_STR_LEN];
+static char                       pntstring[MAX_STR_LEN];
+#endif
+
+//Global variables needed for ess-classification in case of multiple populations//
+//And in order to continue the point where d_R0/d_yy = 0//
+//-----NEW-----//
+int UniqueESSPops[POPULATION_NR]; //Vector with all the evolving populations in it
+int Unique = 1; //co-evolution nr of evolving populations
+int p;
+int k;
+int EvoParsSinglePop[POPULATION_NR][PARAMETER_NR]; //array with for each pop the param that evolves
+int maxESS = POPULATION_NR; //for how many ess to calculate
+//EBPCont//
+int EBPIndex; //Population of which to continue the EBP
+int popEBP_index; //Index of the EBP pop in ess vector
+//-----END-----//
+
+/*
+ *====================================================================================================================================
+ *              Include header files with generic routines
+ *====================================================================================================================================
+ */
+
+#include "memory.h"
+#include "lifehistory.h"
+#include "dopri5.h"
+
+/*==================================================================================================================================*/
+//This is the equation that determines what has to equal 0.
+//Argument is the initial solution, and result the final solution
+int Equation(double *argument, double *result)
+
+{
+  int     indx = 0, e, i, j, b = 0, p, retval = SUCCES, openmpDone = 0;
+  int     MaxCohortDim = CohortDim + 1 + InteractDim;
+  double  norm;
+  double  *NextGenMatrix = NULL, *FinalIstateMem = NULL;
+  int     savedTestRun;
+  double  savedparval, savedbirthstatenr, savedbirthrate;
+  double  *respntr;
+  double  evJ2, evJs2, zCz2, evH;
+
+  /*
+   *===========================================================================
+   * Map current estimate of solution to global variables
+   *===========================================================================
+   */
+  if (setBifParVal) parameter[Bifparone] = argument[indx]*pnt_scale[indx];
+  indx++;
+
+  for (e = 0; e < EnvironDim; e++)
+    {
+      if (EnvTrivEqui[e] || (e == EnvBPIndex))
+        Evar[e] = 0.0;
+      else
+        {
+          Evar[e] = argument[indx]*pnt_scale[indx];
+          indx++;
+        }
+    }
+
+  for (p = 0; p < CurPopulationNr; p++)
+    {
+      if (PopTrivEqui[p] || (p == PopBPIndex) || (p == PopulationNr))
+        Beq[p] = 0.0;
+      else
+        {
+          Beq[p] = argument[indx]*pnt_scale[indx];
+          indx++;
+        }
+    }
+
+  if (CurveType == PIP)
+    MutantParVal = argument[indx]*pnt_scale[indx];
+  else if (CurveType == ESS)
+    {
+      for (i = 0; i < essParsDim; i++)
+        {
+          parameter[essParsIndex[i]] = argument[indx]*pnt_scale[indx];
+          indx++;
+        }
+    }
+    else if (CurveType == EBPC){
+         parameter[Bifpartwo] = argument[indx]*pnt_scale[indx];
+         indx++;
+         for (i = 0; i < essParsDim; i++)
+         {
+           parameter[essParsIndex[i]] = argument[indx]*pnt_scale[indx];
+           indx++;
+         }
+    }
+  else if (CurveType != EQ)
+    parameter[Bifpartwo] = argument[indx]*pnt_scale[indx];
+ 
+
+  /*
+   *===========================================================================
+   * Set the dimensions
+   *===========================================================================
+   */
+  if (CurveType == PIP)
+    {
+      CurPopulationNr = PopulationNr + 1;
+      savedparval     = parameter[Bifparone];
+
+      parameter[Bifparone] = MutantParVal;
+      // Set the mutant number of birth states
+      SetBirthStates(BirthStateNr, Evar);
+      BirthStateNr[PopulationNr] = BirthStateNr[PIPEVOIndex];
+
+      // Restore the resident parameter value
+      parameter[Bifparone] = savedparval;
+    }
+  else
+      CurPopulationNr = PopulationNr;
+  SetBirthStates(BirthStateNr, Evar);
+
+  MaxStatesAtBirth = 0;
+  for (p = 0; p < CurPopulationNr; p++)
+    {
+      BirthStateNr[p]  = max(BirthStateNr[p], 1);
+      MaxStatesAtBirth = max(MaxStatesAtBirth, BirthStateNr[p]);
+      MaxCohortDim     = CohortDim + MaxStatesAtBirth + InteractDim;
+    }
+
+  // Allocate the local memory and initialize it to 0
+  NextGenMatrix  = calloc(MaxStatesAtBirth*MaxStatesAtBirth, sizeof(double));
+  FinalIstateMem = calloc(MaxStatesAtBirth*CurPopulationNr*MaxCohortDim, sizeof(double));
+  retval         = AllocateHeapMemory();
+
+  if ((retval != SUCCES) || (!NextGenMatrix) || (!FinalIstateMem))
+    {
+      if (FinalIstateMem) free(FinalIstateMem);
+      if (NextGenMatrix) free(NextGenMatrix);
+      FreeHeapMemory();
+      return ReportMemError("Equation");
+    }
+
+#if (FULLSTATEOUTPUT > 0)
+  memset(BirthStateMem, 0, CurPopulationNr*MaxStatesAtBirth*IStateDim*sizeof(double));
+  memset(PopDensMem, 0, CurPopulationNr*MaxStatesAtBirth*PopDensCohortDim*CohortNr*sizeof(double));
+  memset(CohortsMem, 0, CurPopulationNr*MaxStatesAtBirth*sizeof(int));
+#endif
+
+  /*
+   *===========================================================================
+   * Testing output
+   *===========================================================================
+   */
+
+  if (TestRun)
+    {
+      STDOUT("\n\nParameter #1:                %15.6G", parameter[Bifparone]);
+      for (e = 0; e < EnvironDim; e++) STDOUT("\nEnvironment variable #%d:     %15.6G", e, Evar[e]);
+      for (p = 0; p < CurPopulationNr; p++) STDOUT("\nBirth rate of population #%d: %15.6G", p, Beq[p]);
+      if (CurveType == PIP)
+        STDOUT("\nMutant parameter value:      %15.6G", MutantParVal);
+      else if ((CurveType != EQ) && (CurveType != ESS))
+        STDOUT("\nParameter #2:                %15.6G", parameter[Bifpartwo]);
+
+      STDOUT("\n\n\n%40s", "");
+      for (i = 0; i < IStateDim; i++) STDOUT("%12s%2d]", "Istate[", i);
+
+      STDOUT("       Survival%15s", "R0");
+      for (i = 0; i < InteractDim; i++) STDOUT("     Impact[%2d]", i);
+      STDOUT("\n");
+#if (defined(R_PACKAGE))
+      R_FlushConsole();
+      R_ProcessEvents();
+#endif
+    }
+
+  /*
+   *===========================================================================
+   * The life history integration loop. Integration is carried out for each
+   * state at birth separately. The states at birth are processed from the
+   * highest to the lowest, because not all populations may have an equal
+   * number of state at birth.
+   *===========================================================================
+   */
+
+  retval = SUCCES;
+  if (CurveType == PIP)
+    {
+      // Save the resident number of birth states
+      savedparval       = parameter[Bifparone];
+      savedbirthstatenr = BirthStateNr[PIPEVOIndex];
+      savedbirthrate    = Beq[PIPEVOIndex];
+      Beq[PIPEVOIndex]  = 0.0;
+
+      // Set the mutant parameter value and number of birth states
+      parameter[Bifparone]      = MutantParVal;
+      BirthStateNr[PIPEVOIndex] = BirthStateNr[PopulationNr];
+
+      openmpDone = 0;
+#if (defined(OPENMP) && (RFUNCTIONS != 1) && (MFUNCTIONS != 1))                     // If using R-defined or Matlab-defined model this parallelization is impossible
+      if (!TestRun)
+        {
+#pragma omp parallel for private(i) if (MaxStatesAtBirth > 1)                       // Only use threading with multiple states at birth
+          for (b = 0; b < BirthStateNr[PIPEVOIndex]; b++)
+            {
+              if (!LifeHistory(BirthStateNr, b, MaxCohortDim, FinalIstatePnt(b, 0, 0))) retval = FAILURE;
+
+              memcpy(FinalIstatePnt(b, PopulationNr, 0), FinalIstatePnt(b, PIPEVOIndex, 0), (CohortDim + BirthStateNr[PIPEVOIndex])*sizeof(double));
+#if (FULLSTATEOUTPUT > 0)
+              if (DoStateOutput)
+                {
+                  memcpy(BirthStatePnt(PopulationNr, b, 0), BirthStatePnt(PIPEVOIndex, b, 0), IStateDim*sizeof(double));
+                  for (i = 0; i < CohortDim; i++)                                  // Do not copy the zero population density
+                    memcpy(&(PopDens(PopulationNr, b, i, 0)), &(PopDens(PIPEVOIndex, b, i, 0)), Cohorts(PIPEVOIndex, b)*sizeof(double));
+                  Cohorts(PopulationNr, b) = Cohorts(PIPEVOIndex, b);
+                }
+#endif
+            }
+          openmpDone = 1;
+        }
+#endif
+      if (!openmpDone)
+        {
+          for (b = 0; b < BirthStateNr[PIPEVOIndex]; b++)
+            {
+              if (!LifeHistory(BirthStateNr, b, MaxCohortDim, FinalIstatePnt(b, 0, 0))) retval = FAILURE;
+
+              memcpy(FinalIstatePnt(b, PopulationNr, 0), FinalIstatePnt(b, PIPEVOIndex, 0), (CohortDim + BirthStateNr[PIPEVOIndex])*sizeof(double));
+#if (FULLSTATEOUTPUT > 0)
+              if (DoStateOutput)
+                {
+                  memcpy(BirthStatePnt(PopulationNr, b, 0), BirthStatePnt(PIPEVOIndex, b, 0), IStateDim*sizeof(double));
+                  for (i = 0; i < CohortDim; i++)                                  // Do not copy the zero population density
+                    memcpy(&(PopDens(PopulationNr, b, i, 0)), &(PopDens(PIPEVOIndex, b, i, 0)), Cohorts(PIPEVOIndex, b)*sizeof(double));
+                  Cohorts(PopulationNr, b) = Cohorts(PIPEVOIndex, b);
+                }
+#endif
+            }
+        }
+
+      // Restore the resident parameter value and number of birth states
+      parameter[Bifparone]      = savedparval;
+      BirthStateNr[PIPEVOIndex] = savedbirthstatenr;
+      Beq[PIPEVOIndex]          = savedbirthrate;
+    }
+//end curve = PIP
+  openmpDone = 0;
+#ifdef OPENMP
+  if (!TestRun)
+    {
+#pragma omp parallel for if (MaxStatesAtBirth > 1)                                  // Only use threading with multiple states at birth
+      for (b = 0; b < MaxStatesAtBirth; b++)
+        if (!LifeHistory(BirthStateNr, b, MaxCohortDim, FinalIstatePnt(b, 0, 0))) retval = FAILURE;
+      openmpDone = 1;
+    }
+#endif
+  if (!openmpDone)
+    {
+      for (b = 0; b < MaxStatesAtBirth; b++)
+        if (!LifeHistory(BirthStateNr, b, MaxCohortDim, FinalIstatePnt(b, 0, 0))) retval = FAILURE;
+    }
+
+  if (retval == FAILURE)
+    {
+      if (FinalIstateMem) free(FinalIstateMem);
+      if (NextGenMatrix) free(NextGenMatrix);
+      return FAILURE;
+    }
+
+  /*
+   *===========================================================================
+   * Compute the final values of the fixed point equation F(y)=0,
+   *===========================================================================
+   */
+  for (p = 0; p < CurPopulationNr; p++)
+    {
+      if (BirthStateNr[p] == 1)
+        {
+          R0[p] = FinalIstate(0, p, CohortDim);
+          RightEigenvec(p, 0) = 1.0;
+          for (i               = 0; i < InteractDim; i++)
+            InteractVars[p][i] = Beq[p]*FinalIstate(0, p, CohortDim + 1 + i);       // Multiply all measures with the birth rate
+#if (FULLSTATEOUTPUT > 0)
+          CohortLimit(0, p) = (FinalIstate(0, p, SortIndex) - BirthState(p, 0, SortIndex))/COHORT_NR;
+#endif
+        }
+      else
+        {
+          // Notice that in the next generation matrix the first index is the index of the offspring, the second index
+          // is the index of the parent. This means that row b of the next generation represent all offspring with state
+          // at birht #b produced by all the different parent types with state at birth #j.
+          // Hence, the data in Istate[][][] have to be transposed, because here the first index is the parent index
+          // whereas the second index is the type of offspring they produce
+          for (b = 0; b < BirthStateNr[p]; b++)
+            for (j = 0; j < BirthStateNr[p]; j++) NextGenMatrix[b*BirthStateNr[p] + j] = FinalIstate(j, p, CohortDim + b);
+
+          if (Eigenval(BirthStateNr[p], NextGenMatrix, 0, R0 + p, DOMINANT, &(RightEigenvec(p, 0)), NULL, RHSTOL) != SUCCES)
+            {
+              ErrorMsg(__FILE__, __LINE__, "Computation of dominant eigenvalue failed for population %d!", p);
+              if (FinalIstateMem) free(FinalIstateMem);
+              if (NextGenMatrix) free(NextGenMatrix);
+              return FAILURE;
+            }
+
+          // Scale the right eigenvector such that the elements sum to 1
+          for (b = 0, norm = 0; b < BirthStateNr[p]; b++)
+            {
+              if (fabs(RightEigenvec(p, b)) < Odesolve_Func_Tol)
+                RightEigenvec(p, b) = 0.0;
+              else
+                norm += RightEigenvec(p, b);
+            }
+          SCAL(BirthStateNr[p], 1.0/norm, &(RightEigenvec(p, 0)), 1);
+
+          // Check the validity of the right eigenvector
+          for (b = 0; b < BirthStateNr[p]; b++)
+            {
+              if (RightEigenvec(p, b) < 0)
+                {
+                  ErrorMsg(__FILE__, __LINE__, "Negative and positive elements in right eigenvector of population %d!", p);
+                  if (FinalIstateMem) free(FinalIstateMem);
+                  if (NextGenMatrix) free(NextGenMatrix);
+                  return FAILURE;
+                }
+            }
+
+          for (i = 0; i < InteractDim; i++)
+            {
+              InteractVars[p][i] = 0.0;
+              for (b = 0; b < BirthStateNr[p]; b++) InteractVars[p][i] += RightEigenvec(p, b)*FinalIstate(b, p, CohortDim + BirthStateNr[p] + i);
+              InteractVars[p][i] *= Beq[p];                                         // Multiply all measures with the birth rate
+            }
+#if (FULLSTATEOUTPUT == 1)
+          CohortMin[p] = SAFETY*DBL_MAX;
+          CohortMax[p] = -SAFETY*DBL_MAX;
+          for (b = 0; b < BirthStateNr[p]; b++)
+            {
+              if (RightEigenvec(p, b))
+                {
+                  CohortMin[p] = min(CohortMin[p], BirthState(p, b, SortIndex));
+                  CohortMax[p] = max(CohortMax[p], FinalIstate(b, p, SortIndex));
+                }
+            }
+          for (b = 0; b < BirthStateNr[p]; b++) CohortLimit(b, p) = (CohortMax[p] - CohortMin[p])/COHORT_NR;
+#elif (FULLSTATEOUTPUT == 2)
+          for (b = 0; b < BirthStateNr[p]; b++) CohortLimit(b, p) = (FinalIstate(b, p, SortIndex) - BirthState(p, b, SortIndex))/COHORT_NR;
+#endif
+        }
+    }
+
+  EnvEqui(Evar, InteractVars, EnvEquiCondition);
+
+  if (TestRun)
+    {
+      STDOUT("\n\n\n%31s", "");
+      for (i = 0; i < IStateDim; i++) STDOUT("%12s%2d]", "Istate[", i);
+      STDOUT("       Survival%15s", "R0");
+      for (i = 0; i < InteractDim; i++) STDOUT("   InteractVar[%2d]", i);
+
+      for (p = 0; p < CurPopulationNr; p++)
+        {
+          for (b = 0; b < BirthStateNr[p]; b++)
+            {
+              STDOUT("\nPop. #%2d - Bstate %2d - (Final):", p, b);
+              for (i = 0; i < IStateDim; i++) STDOUT("%15.6G", FinalIstate(b, p, i));
+              STDOUT("%15.6G", exp(FinalIstate(b, p, IStateDim)));
+              STDOUT("%15.6G", SUM(BirthStateNr[p], FinalIstatePnt(b, p, CohortDim), 1));
+              for (i = 0; i < InteractDim; i++) STDOUT("%18.6G", Beq[p]*FinalIstate(b, p, CohortDim + BirthStateNr[p] + i));
+            }
+          if (BirthStateNr[p] > 1)
+            {
+              STDOUT("\n\n\n");
+              STDOUT("|");
+              for (j = 0; j < (15*BirthStateNr[p] - 26)/2; j++) STDOUT("-");
+              STDOUT("  Next generation matrix  ");
+              for (j = 0; j < (15*BirthStateNr[p] - 25)/2; j++) STDOUT("-");
+              STDOUT("|\n");
+              for (b = 0; b < BirthStateNr[p]; b++)
+                {
+                  for (j = 0; j < BirthStateNr[p]; j++)
+                    {
+                      STDOUT("%15.6G", NextGenMatrix[b*BirthStateNr[p] + j]);
+                    }
+                  STDOUT(" |");
+                  STDOUT("%15.6G", SUM(BirthStateNr[p], NextGenMatrix + b*BirthStateNr[p], 1));
+                  STDOUT("\n");
+                }
+              for (j = 0; j < BirthStateNr[p]; j++) STDOUT("  -------------");
+              STDOUT("\n");
+              for (j = 0; j < BirthStateNr[p]; j++) STDOUT("%15.6G", SUM(BirthStateNr[p], NextGenMatrix + j, BirthStateNr[p]));
+
+              STDOUT("\n\n\nEig(M) : %12.6E", R0[p]);
+
+              STDOUT("\n\n\nStable birth distribution\n");
+              for (b = 0; b < BirthStateNr[p]; b++) STDOUT("%14.6G  ", RightEigenvec(p, b));
+            }
+        }
+
+      STDOUT("\n\n");
+      for (e = 0; e < EnvironDim; e++) STDOUT("\nEquilibrium condition environment variable %2d:\t\t%18.6G", e, EnvEquiCondition[e]);
+      STDOUT("\n");
+#if (defined(R_PACKAGE))
+      R_FlushConsole();
+      R_ProcessEvents();
+#endif
+    }
+
+  /*
+   * Now assign all the result values that determine the fixed point F(y) = 0.
+   *
+   * Remember parameter has index 0, hence the first environment variable has index 1 in pnt_scale
+   */
+  indx    = 1;
+  respntr = result;
+  for (e = 0; e < EnvironDim; e++)
+    {
+      if (EnvTrivEqui[e] && (e != EnvBPIndex)) continue;
+      if (EnvironmentType[e] == GENERALODE)
+        *respntr = EnvEquiCondition[e]/pnt_scale[indx];
+      else if (EnvironmentType[e] == POPULATIONINTEGRAL)
+        *respntr = (Evar[e] - EnvEquiCondition[e])/pnt_scale[indx];
+      else
+        *respntr = EnvEquiCondition[e];
+      respntr++;
+      indx++;
+    }
+  for (p = 0; p < CurPopulationNr; p++)
+    {
+      if (PopTrivEqui[p] && (p != PopBPIndex) && (p != PopulationNr)) continue;
+      *respntr = R0[p] - 1.0;
+      respntr++;
+    }
+  if ((CurveType == LP) && (!DoStateOutput))
+    {
+      savedTestRun = TestRun;
+      TestRun      = 0;
+      retval       = LPcondition(pntdim, argument, Equation, CENTRAL, 1, respntr, DYTOL);
+      TestRun      = savedTestRun;
+    }
+  else if ((CurveType == ESS) && (!DoStateOutput))
+    {
+      savedTestRun = TestRun;
+      TestRun      = 0;
+      for (i = 0; i < essParsDim; i++)
+        {
+          retval = SelectionGradient(pntdim, argument, Equation, (pntdim - essParsDim) + i, R0ResIndex[essPopsIndex[i]], respntr);
+          respntr++;
+        }
+      TestRun = savedTestRun;
+    }
+    
+    else if ((CurveType == EBPC) && (!DoStateOutput))  //NEW// Continuation of R0_yy = 0
+    {
+      for (i = 0; i < essParsDim; i++) //First ESS//
+        {
+          retval = SelectionGradient(pntdim, argument, Equation, (pntdim - essParsDim) + i, R0ResIndex[essPopsIndex[i]], respntr); //CHECK THIS!
+          respntr++;
+        }
+        evoParsDim_single = EvoParsSinglePop[popEBP_index][0]; //how many traits evolve for this pop
+        evoParsIndexPntr  = &EvoParsSinglePop[popEBP_index][1]; //point to the evolving trait
+        retval = FindEBP(pntdim, argument, Equation, DYTOL, RHSTOL, R0ResIndex[EBPIndex], respntr,  0); //Point where R0_yy == 0
+        respntr++;
+    }
+     
+
+  // Add additional conditions in case of LP or ESS localization. Occurs only during EQ or ESS continuation, when called from LocateLP() or locateESS()
+  savedTestRun = TestRun;
+  TestRun      = 0;
+  if (LocalizeType == LP)
+    retval = LPcondition(pntdim, argument, Equation, CENTRAL, 0, respntr, DYTOL);
+  else if (LocalizeType == ESS)
+    {
+      if (ParEVOIndex[locateEvoPar] == Bifparone)
+        retval = SelectionGradient(pntdim, argument, Equation, 0, R0ResIndex[PopEVOIndex[locateEvoPar]], respntr);
+      else if (ParEVOIndex[locateEvoPar] >= 0)
+        retval = SelectionGradient(pntdim, argument, Equation, pntdim + ParEVOIndex[locateEvoPar], R0ResIndex[PopEVOIndex[locateEvoPar]], respntr);
+    }
+  /*else if (LocalizeType == EBPC){
+      evoParsDim_single = EvoParsSinglePop[locateEBPPop][0]; //how many traits evolve for this pop
+      evoParsIndexPntr  = &EvoParsSinglePop[locateEBPPop][1];
+      retval = FindEBP(pntdim, argument, Equation, DYTOL, RHSTOL, R0ResIndex[locateEBPPop], respntr,  0);
+      evoParsIndexPntr  = essParsIndex;
+  }*/
+  TestRun  = savedTestRun;
+
+  if (FinalIstateMem) free(FinalIstateMem);
+  if (NextGenMatrix) free(NextGenMatrix);
+  return retval;
+}
+
+
+/*==================================================================================================================================*/
+
+int DefineOutput(double *x, double *output)
+
+{
+  int     outnr = 0, i, j, retval;
+  double  result[MaxPntDim];
+  double  evJ, evJs, evH, zCz;
+
+#if (FULLSTATEOUTPUT > 0)
+  DoStateOutput = 1;
+  Equation(x, result);
+  DoStateOutput = 0;
+  WriteStateToFile(FULLSTATEOUTPUT);
+  if ((CurveType == LP) || (CurveType == ESS) || (CurveType == EBPC) || (CurveType == PIP)) Equation(x, result);
+#else
+  Equation(x, result);
+#endif
+
+  // There are maximally (EnvironDim+PopulationNr+2) values in the point vector
+  // to solve for, which occurs when continuing an LP for this system. In all cases
+  // the (EnvironDim+PopulationNr+2) values are written to the output file
+  output[outnr++] = parameter[Bifparone];
+  for (i = 0; i < EnvironDim; i++) output[outnr++] = Evar[i];
+  for (i = 0; i < PopulationNr; i++) output[outnr++] = Beq[i];
+  if (CurveType == PIP)
+    output[outnr++] = MutantParVal;
+  else if (CurveType == ESS)
+    {
+      for (i = 0; i < essParsDim; i++) output[outnr++] = parameter[essParsIndex[i]];
+    }
+  else if (CurveType == EBPC) { //NEW continuation of R0_yy = 0.
+      output[outnr++] = parameter[Bifpartwo];
+    {
+      for (i = 0; i < essParsDim; i++) output[outnr++] = parameter[essParsIndex[i]];
+    }}
+  else if (CurveType != EQ)
+    output[outnr++] = parameter[Bifpartwo];
+
+  // Also add all interaction variables
+  for (i = 0; i < PopulationNr; i++)
+    for (j = 0; j < InteractDim; j++) output[outnr++] = InteractVars[i][j];
+
+  for (i = 0; i < EnvironDim; i++)
+    if (EnvironmentType[i] == PERCAPITARATE) output[outnr++] = EnvEquiCondition[i];
+
+  for (i = 0; i < CurPopulationNr; i++) output[outnr++] = R0[i];
+
+  if ((CurveType == EQ) || (CurveType == ESS))  //additional selection gradients
+    {
+      for (i = 0; i < ParEVODim; i++)
+        {
+          if ((PopEVOIndex[i] < 0) || (R0ResIndex[PopEVOIndex[i]] < 0)) continue;
+          if (ParEVOIndex[i] == Bifparone)
+            retval = SelectionGradient(pntdim, x, Equation, 0, R0ResIndex[PopEVOIndex[i]], output + outnr);
+          else if (ParEVOIndex[i] >= 0)
+            retval = SelectionGradient(pntdim, x, Equation, pntdim + ParEVOIndex[i], R0ResIndex[PopEVOIndex[i]], output + outnr);
+          outnr++;
+        }
+    }
+
+    if (((CurveType == ESS) || (CurveType == EBPC)) && classifyESS && maxESS > 0) //classification of the ESS points NEW
+    {
+           //Calculation for co-evolution.
+            ReportMsg("\nStart of the ESS calculation for multiple evolving populations :\t");
+        
+            for (i = 0; i < Unique; i++){
+                //ReportMsg("\nClassifying ESS point of population %d with R0 index %d:\t", UniqueESSPops[i], R0ResIndex[UniqueESSPops[i]]);
+                evoParsDim_single = EvoParsSinglePop[i][0]; //how many traits evolve for this pop?
+                evoParsIndexPntr  = &EvoParsSinglePop[i][1]; //point to the evolving trait index of this pop
+                ReportMsg("evoparsdim %d :\t", evoParsDim_single);
+                ReportMsg("\npars pnter %d:\t",*evoParsIndexPntr);
+                //calculation
+                evoParsIndexPntr2 = evoParsIndexPntr;
+              
+                if (CurveType == EBPC) {
+                    ReportMsg("\nClassify ESS for pop %d :\t", i);
+                    retval = ESSclassify2(pntdim, x, Equation, DYTOL, RHSTOL,  R0ResIndex[UniqueESSPops[i]], &evJ, &evJs, &evH, &zCz, 0);
+                } else {
+                retval = ESSclassify(pntdim, x, Equation, DYTOL, RHSTOL,  R0ResIndex[UniqueESSPops[i]], &evJ, &evJs, &evH, &zCz, 0); //Classify ESS for this pop
+                    }
+                //Output
+                if (retval == SUCCES) {
+                    output[outnr++]     = evJ;
+                    output[outnr++]     = evH;
+                    if (evoParsDim_single > 1)
+                    {
+                        output[outnr++] = evJs;
+                        output[outnr++] = zCz;
+                    }
+                }
+                else
+                {
+                    output[outnr++]     = INFINITY;
+                    output[outnr++]     = INFINITY;
+                    if (evoParsDim_single > 1)
+                    {
+                        output[outnr++] = INFINITY;
+                        output[outnr++] = INFINITY;
+                    }
+                }
+            
+            }
+        
+            evoParsIndexPntr  = essParsIndex;
+        ReportMsg("\nEnd of the ESS calculation :\t");
+        
+    }
+ 
+     
+    
+  // Should we indeed add how accurate the solution was?
+  output[outnr++] = NRM2(pntdim - 1, result, 1);
+
+  return outnr;
+}
+
+
+/*
+ *====================================================================================================================================
+ *  Implementation of the routine that computes the entire curve
+ *====================================================================================================================================
+ */
+
+void ComputeCurve(const int argc, char **argv)
+{
+  register int  i, j, colnr;
+  int           pntnr = 0, outmax, CurveEnd = 0, hasjac = 0, TestBifs = 0, DoOutput = 1;
+  int           cycles, last = 1, retval = 0;
+  double        oldpoint[MaxPntDim];
+  double        point[MaxPntDim], tanvec[MaxPntDim], oldvec[MaxPntDim], Jacmat[MaxPntDim*MaxPntDim];
+  double        newEEC[EnvironDim], oldEEC[EnvironDim];
+  double        newR0[PopulationNr + 1], oldR0[PopulationNr + 1];
+  double        newdR0dp[ParameterNr][PopulationNr + 1], olddR0dp[ParameterNr][PopulationNr + 1];
+  double        R0_xx, R0_yy, zCz;
+  char          bifname[MAX_STR_LEN], csbname[MAX_STR_LEN], errname[MAX_STR_LEN], outname[MAX_STR_LEN];
+  char          tmpstr[MAX_STR_LEN];
+  struct stat   buffer;
+    EBPCalc = 1;
+
+#if defined(R_PACKAGE)
+  STDOUT("\n");
+#else
+  fprintf(stderr, "\n");
+#endif
+
+  for (i = 0; i < (PopulationNr + 1); i++) oldR0[i] = 1.0;
+  for (i = 0; i < (PopulationNr + 1); i++) newR0[i] = 1.0;
+  memset(olddR0dp, 0, ParameterNr*(PopulationNr + 1)*sizeof(double));
+  memset(newdR0dp, 0, ParameterNr*(PopulationNr + 1)*sizeof(double));
+
+  COPY(pntdim, initpnt, 1, point, 1);
+  (void)SetScales(point, pntdim);
+
+  evoParsDim = essParsDim;
+
+  if (TestRun)
+    {
+      double rhs[MaxPntDim], rhsnorm;
+
+#if defined(R_PACKAGE)
+      STDOUT("\n\nExecuting : ");
+      STDOUT("PSPMequi(\"%s\", '%s', %s, %s, %s, %s)", progname, ContinuationString, pntstring, curvestring, parstring, optstring);
+#elif defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE)
+      STDOUT("\n\nExecuting : ");
+      STDOUT("PSPMequi('%s', '%s', %s, %s, %s, %s)", progname, ContinuationString, pntstring, curvestring, parstring, optstring);
+#else
+      STDOUT("Executing : ");
+      for (i = 0; i < argc; i++) STDOUT("%s ", argv[i]);
+#endif
+      STDOUT("\n\n");
+
+      STDOUT("Parameter values  : \n");
+      for (i = 0; i < ParameterNr; i++)
+        {
+          if (!(i % 3)) STDOUT("\n");
+          STDOUT("\t%-10s:", parameternames[i]);
+          STDOUT("  %-13G", parameter[i]);
+        }
+      STDOUT("\n");
+      fflush(NULL);
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE)
+      mexEvalString("pause(0.0001);");
+#elif (defined(R_PACKAGE))
+      R_FlushConsole();
+      R_ProcessEvents();
+#endif
+
+      errfile = stderr;
+      
+      Equation(point, rhs);
+      
+      // Compute rhsnorm
+      rhsnorm = NRM2(pntdim - 1, rhs, 1);
+      rhsnorm = rhsnorm/(1.0 + rhsnorm);
+
+      STDOUT("\n\nNorm of fixed point conditions: %18.6G", rhsnorm);
+
+      STDOUT("\n\n");
+#if (defined(R_PACKAGE))
+      R_FlushConsole();
+      R_ProcessEvents();
+#endif
+
+      FreeHeapMemory();
+      return;
+    }
+
+  if (strlen(runname))
+    {
+      sprintf(bifname, "%s.bif", runname);
+      sprintf(errname, "%s.err", runname);
+      sprintf(outname, "%s.out", runname);
+    }
+  else
+    {
+#if !defined(MATLAB_MEX_FILE) && !defined(OCTAVE_MEX_FILE) && !defined(R_PACKAGE)
+      strcpy(progname, argv[0]);
+      progname[strlen(progname) - 4] = '\0';                                        // Cut off the 'equi' appendix
+#endif
+      i = 0;
+      while (1)
+        {
+          sprintf(bifname, "%s-%s-%04d.bif", progname, ContinuationString, i);
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE)
+          sprintf(csbname, "%s-%s-%04d.mat", progname, ContinuationString, i);
+#else
+          sprintf(csbname, "%s-%s-%04d.csb", progname, ContinuationString, i);
+#endif
+          sprintf(errname, "%s-%s-%04d.err", progname, ContinuationString, i);
+          sprintf(outname, "%s-%s-%04d.out", progname, ContinuationString, i);
+          if (stat(bifname, &buffer) && stat(csbname, &buffer) && stat(errname, &buffer) && stat(outname, &buffer)) break;
+          i++;
+        }
+      sprintf(runname, "%s-%s-%04d", progname, ContinuationString, i);
+    }
+
+  if ((CurveType == EQ) || (CurveType == ESS)) biffile = fopen(bifname, "w");
+  errfile                                              = fopen(errname, "w");
+  outfile                                              = fopen(outname, "w");
+
+  if (outfile)
+    {
+      fprintf(outfile, "#\n# Executing : ");
+
+#if defined(R_PACKAGE)
+      fprintf(outfile, "PSPMequi(\"%s\", \"%s\", %s, %G, %s, %s, %s)", progname, ContinuationString, pntstring, Maxcurvestep, curvestring, parstring,
+              optstring);
+#elif defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE)
+      fprintf(outfile, "PSPMequi('%s', '%s', %s, %G, %s, %s, %s)", progname, ContinuationString, pntstring, Maxcurvestep, curvestring, parstring,
+              optstring);
+#else
+      for (i = 0; i < argc; i++) fprintf(outfile, "%s ", argv[i]);
+#endif
+      fprintf(outfile, "\n#\n");
+
+      fprintf(outfile, "# Parameter values  : \n#");
+      for (i = 0; i < ParameterNr; i++)
+        {
+          if (!(i % 3)) fprintf(outfile, "\n# ");
+          fprintf(outfile, "\t%-10s:", parameternames[i]);
+          fprintf(outfile, "  %-13G", parameter[i]);
+        }
+      fprintf(outfile, "\n#\n");
+      fprintf(outfile, "# Index and name of bifurcation parameter #1                   : %d (%s)\n", Bifparone, parameternames[Bifparone]);
+      if ((CurveType == BP) || (CurveType == LP) || (CurveType == EBPC) || (CurveType == BPE))
+        fprintf(outfile, "# Index and name of bifurcation parameter #2                   : %d (%s)\n", Bifpartwo, parameternames[Bifpartwo]);
+      if (CurveType == BPE) fprintf(outfile, "# Index of environment variable with transcritical bifurcation : %d\n", EnvBPIndex);
+      if (CurveType == BP) fprintf(outfile, "# Index of structured population with transcritical bifurcation: %d\n", PopBPIndex);
+
+      if ((CurveType == EQ) || (CurveType == ESS)) //selection gradient
+        {
+          for (i = 0; i < ParEVODim; i++)
+            {
+              fprintf(outfile, "# Index and name of parameter #%d to monitor selection gradient : %d (%s)\n", i + 1, ParEVOIndex[i], parameternames[ParEVOIndex[i]]);
+              fprintf(outfile, "# Index of structured population selection gradient belongs to : %d\n", PopEVOIndex[i]);
+            }
+        }
+      if ((CurveType == ESS) || (CurveType == EBPC))
+        {
+          for (i = 0; i < essParsDim; i++)
+            {
+              fprintf(outfile, "# Index and name of parameter #%d at ESS value                  : %d (%s)\n", i + 1, essParsIndex[i], parameternames[essParsIndex[i]]);
+              fprintf(outfile, "# Index of the population that parameter #%d pertains to        : %d\n", i + 1, essPopsIndex[i]);
+            }
+        }
+      if (CurveType == PIP)
+        fprintf(outfile, "# Index of structured population for PIP construction          : %d\n", PIPEVOIndex);
+
+      fprintf(outfile, "#\n");
+#if !defined(MATLAB_MEX_FILE) && !defined(OCTAVE_MEX_FILE) && !defined(R_PACKAGE)   // In command-line model follow C convention of 0 start index
+      colnr = 0;
+#else
+      colnr = 1;
+#endif
+      sprintf(tmpstr, "%d:%s", colnr++, parameternames[Bifparone]);
+      fprintf(outfile, "#%15s", tmpstr);
+      for (i = 0; i < EnvironDim; i++)
+        {
+          sprintf(tmpstr, "%d:E[%d]", colnr++, i);
+          fprintf(outfile, "%16s", tmpstr);
+        }
+      for (i = 0; i < PopulationNr; i++)
+        {
+          sprintf(tmpstr, "%d:b[%d]", colnr++, i);
+          fprintf(outfile, "%16s", tmpstr);
+        }
+        if (CurveType == EBPC)
+        {
+          sprintf(tmpstr, "%d:%s", colnr++, parameternames[Bifpartwo]);
+          fprintf(outfile, "%16s", tmpstr);
+        }
+        
+      if ((CurveType == ESS) || (CurveType == EBPC))
+        {
+          for (i = 0; i < essParsDim; i++)
+            {
+              sprintf(tmpstr, "%d:%s", colnr++, parameternames[essParsIndex[i]]);
+              fprintf(outfile, "%16s", tmpstr);
+            }
+        }
+      else if (CurveType == PIP)
+        {
+          sprintf(tmpstr, "%d:%s'", colnr++, parameternames[Bifpartwo]);
+          fprintf(outfile, "%16s", tmpstr);
+        }
+      else if (CurveType != EQ)
+        {
+          sprintf(tmpstr, "%d:%s", colnr++, parameternames[Bifpartwo]);
+          fprintf(outfile, "%16s", tmpstr);
+        }
+      for (i = 0; i < PopulationNr; i++)
+        for (j = 0; j < InteractDim; j++)
+          {
+            sprintf(tmpstr, "%d:I[%d][%d]", colnr++, i, j);
+            fprintf(outfile, "%16s", tmpstr);
+          }
+      for (i = 0; i < EnvironDim; i++)
+        if (EnvironmentType[i] == PERCAPITARATE)
+          {
+            sprintf(tmpstr, "%d:pcgE[%d]", colnr++, i);
+            fprintf(outfile, "%16s", tmpstr);
+          }
+      for (i = 0; i < CurPopulationNr; i++)
+        {
+          sprintf(tmpstr, "%d:R0[%d]", colnr++, i);
+          fprintf(outfile, "%16s", tmpstr);
+        }
+      if ((CurveType == EQ) || (CurveType == ESS))
+        {
+          for (i = 0; i < ParEVODim; i++)
+            {
+              if ((PopEVOIndex[i] < 0) || (R0ResIndex[PopEVOIndex[i]] < 0)) continue;
+              sprintf(tmpstr, "%d:R0_x[%d]", colnr++, ParEVOIndex[i]);
+              fprintf(outfile, "%16s", tmpstr);
+            }
+        }
+      if (((CurveType == ESS) || (CurveType == EBPC)) && classifyESS && maxESS > 0)
+        {
+          if (essParsDim == 1) //Single ESS trait
+            {
+              sprintf(tmpstr, "%d:R0_xx[%d]", colnr++, essParsIndex[0]);
+              fprintf(outfile, "%16s", tmpstr);
+              sprintf(tmpstr, "%d:R0_yy[%d]", colnr++, essParsIndex[0]);
+              fprintf(outfile, "%16s", tmpstr);
+            }
+          else  { //Multiple ESS trait, possibly from more than one population
+              for (i = 0; i < Unique; i++){  //for each population that has an ESS trait, create output names
+                  k = EvoParsSinglePop[i][0]; //Number of ESS traits for population i
+                  if (k == 1) { //Single trait for pop i
+                      sprintf(tmpstr, "%d:R0_xx[%d]", colnr++, UniqueESSPops[i]);
+                      fprintf(outfile, "%16s", tmpstr);
+                      sprintf(tmpstr, "%d:R0_yy[%d]", colnr++, UniqueESSPops[i]);
+                      fprintf(outfile, "%16s", tmpstr);
+                  }
+                  else { //multiple traits for  pop i
+                  
+              sprintf(tmpstr, "%d:eig J[%d]", colnr++, UniqueESSPops[i]);
+              fprintf(outfile, "%16s", tmpstr);
+              sprintf(tmpstr, "%d:eig H[%d]", colnr++, UniqueESSPops[i]);
+              fprintf(outfile, "%16s", tmpstr);
+              sprintf(tmpstr, "%d:eig (J+J')/2[%d]", colnr++,UniqueESSPops[i]);
+              fprintf(outfile, "%16s", tmpstr);
+              sprintf(tmpstr, "%d:Z^T C01 Z[%d]", colnr++, UniqueESSPops[i]);
+              fprintf(outfile, "%16s", tmpstr);
+                  }
+            }
+              }
+        }
+      sprintf(tmpstr, "%d:RHS norm\n", colnr++);
+      fprintf(outfile, "%17s", tmpstr);
+      fflush(outfile);
+    }
+
+  memset((void *)tanvec, 0, pntdim*sizeof(double));
+  tanvec[0] = 1.0;
+
+  // Continue the curve
+  while (1)
+    {
+      // Compute fixed point with new varied parameter
+      cycles = 0;
+       //ReportMsg("Start of the loop\n");
+      while (Stepreduce <= MAX_STEPREDUCE)
+        {
+           // ReportMsg("Find the next point via FindPoint\n\n");
+            if (hasjac) {
+                retval = FindPoint(pntdim, point, Jacmat, tanvec, DYTOL, RHSTOL, MAXITER, Equation);}
+            else {
+                retval = FindPoint(pntdim, point, NULL, tanvec, DYTOL, RHSTOL, MAXITER, Equation);}
+          hasjac   = 0;
+           // ReportMsg("The outcome of findpoint is %d\n\n", retval);
+            if (retval == SUCCES) {
+               // ReportMsg("Returned succesfully from FindPoint. Reset EBPCalc\n\n");
+                //EBPCalc = 1;
+                break;}
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE) || defined(R_PACKAGE)
+          if (checkInterrupt()) break;
+#endif
+
+          NumProcError(__FILE__, __LINE__, retval);
+          //niet een break tegen gekomen, en daarom is er geen vervolg
+          if (!pntnr)
+            {
+              ErrorMsg(__FILE__, __LINE__, "No convergence while locating first point of curve");
+              STDOUT("\n");
+#if (defined(R_PACKAGE))
+              R_FlushConsole();
+              R_ProcessEvents();
+#endif
+              FreeHeapMemory();
+              return;
+            }
+          else if (!Stepchange)                                                     // If unsuccesfull while repeating point return
+            {
+              ErrorMsg(__FILE__, __LINE__, "Failed to locate a solution point after scaling");
+              STDOUT("\n");
+#if (defined(R_PACKAGE))
+              R_FlushConsole();
+              R_ProcessEvents();
+#endif
+              FreeHeapMemory();
+              return;
+            }
+
+          // Generate prediction of solution point with smaller step size
+          cycles++;
+          Stepreduce *= 2;
+          COPY(pntdim, oldpoint, 1, point, 1);
+
+          // AXPY(pntdim, (curvestep/(Stepreduce*pnt_scale[0])), tanvec, 1, point, 1);
+          AXPY(pntdim, (curvestep/Stepreduce), tanvec, 1, point, 1);
+
+          ReportMsg("\n\nPrediction :\t");
+          for (i = 0; i < pntdim; i++) ReportMsg("%16.8E  ", point[i]*pnt_scale[i]);
+          ReportMsg("\n");
+        }
+
+      // If unsuccesfull return
+      if (retval != SUCCES)
+        {
+          ErrorMsg(__FILE__, __LINE__, "Failed to locate a solution point");
+          break;
+        }
+
+      // Report on located point to stderr file
+      ReportMsg("New point :\t");
+      for (i = 0; i < pntdim; i++) ReportMsg("%16.8E  ", point[i]*pnt_scale[i]);
+      ReportMsg("\n");
+
+      if (!DoSingle)                                                                // Single point computation or curve continuation
+        {
+          // Increase step when both this and previous point were located with
+          // the current step size
+          if ((last && !cycles) && (Stepreduce > 1)) Stepreduce /= 2;
+          last = (!cycles);
+
+          // Signal curve stop if one of the components has become negative or parameter is out of bounds
+          // and this is not the curve beginning
+          if (pntnr > 0)//(pntnr > 20)
+            for (i = 0; i < pntdim; i++)
+              CurveEnd = CurveEnd || ((point[i]*pnt_scale[i]) < pntmin[i] - epsMach) || ((point[i]*pnt_scale[i]) > pntmax[i] + epsMach);
+
+          // The R0 values and equilibrium conditions of the environmental variables are being recomputed at every call to Equation()
+          // Therefore save these values for later use in bifurcation detection
+          COPY(EnvironDim, EnvEquiCondition, 1, newEEC, 1);
+          COPY(CurPopulationNr, R0, 1, newR0, 1);
+
+          // Compute the new tangent vector
+          retval = TangentVec(pntdim, point, Jacmat, tanvec, Equation, NULL, DYTOL);
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE) || defined(R_PACKAGE)
+          if (checkInterrupt()) break;
+#endif
+          hasjac = 1;
+          /*
+           * ===================================================================================================
+           * The following code section is the only section that is specific to the problem of continuation
+           * of structured population curves. All other parts of the main routine are generic.
+           * The following lines detect bifurcation points
+           * ===================================================================================================
+           */
+          if (TestBifs)
+            {
+              //******** LAST INDICES IN THE NEXT 3 FUNCTION CALLS HAVE TO BE CORRECTED FOR TOTAL VARS IN TRIVIAL
+              for (i = 0; i < PopulationNr; i++)
+                {
+                  if (BPdetection && (PopTrivEqui[i] && ((oldR0[i] - 1)*(newR0[i] - 1) < -RHSTOL*RHSTOL)))
+                    {
+                      LPdetection = 0;
+                      LocateBP(&pntdim, point, Equation, DYTOL, RHSTOL, i, -1);
+                      newR0[i] = 1.0;
+                    }
+                  else if (PopTrivEqui[i])
+                    continue;
+                  else if (BPdetection && (oldpoint[PopPntIndex[i]]*point[PopPntIndex[i]] < -DYTOL*DYTOL))
+                    {
+                      LPdetection = 0;
+                      LocateBP(&pntdim, point, Equation, DYTOL, RHSTOL, i, PopPntIndex[i]);
+                    }
+                  else
+                    {
+                      for (j = 0; j < ParEVODim; j++)
+                        {
+                          if ((i != PopEVOIndex[j]) || (PopEVOIndex[j] < 0) || (R0ResIndex[PopEVOIndex[j]] < 0)) continue;
+                          if (ParEVOIndex[j] == Bifparone)
+                            retval = SelectionGradient(pntdim, point, Equation, 0, R0ResIndex[PopEVOIndex[j]], newdR0dp[j] + PopEVOIndex[j]);
+                          else if (ParEVOIndex[j] >= 0)
+                            retval = SelectionGradient(pntdim, point, Equation, pntdim + ParEVOIndex[j], R0ResIndex[PopEVOIndex[j]], newdR0dp[j] + PopEVOIndex[j]);
+                          if ((retval == SUCCES) && (olddR0dp[j][PopEVOIndex[j]]*newdR0dp[j][PopEVOIndex[j]] < -RHSTOL*RHSTOL))
+                            {
+                              locateEvoPar = j;
+                              LocateESS(pntdim, point, Equation, DYTOL, RHSTOL, PopEVOIndex[j], R0ResIndex[PopEVOIndex[j]]);
+                            }
+                        }
+                    }
+                }
+              for (i = 0; BPdetection && (i < EnvironDim); i++)
+                if (EnvironmentType[i] == PERCAPITARATE)
+                  {
+                    if (EnvTrivEqui[i] && (oldEEC[i]*newEEC[i] < -RHSTOL*RHSTOL))
+                      {
+                        LPdetection = 0;
+                        LocateBPE(&pntdim, point, Equation, DYTOL, RHSTOL, i, -1);
+                      }
+                    else if (EnvTrivEqui[i])
+                      continue;
+                    else if (oldpoint[EnvPntIndex[i]]*point[EnvPntIndex[i]] < -DYTOL*DYTOL)
+                      {
+                        LPdetection = 0;
+                        LocateBPE(&pntdim, point, Equation, DYTOL, RHSTOL, i, EnvPntIndex[i]);
+                      }
+                  }
+              if (LPdetection && (tanvec[0]*oldvec[0] < -DYTOL*DYTOL)) LocateLP(pntdim, point, Equation, DYTOL, RHSTOL);
+            }
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE) || defined(R_PACKAGE)
+          if (checkInterrupt()) break;
+#endif
+
+          // When during the construction of a PIP we end up in the ESS on the line y=x,
+          // make the tangent vector to the curve perpendicular to the line y=x to force the
+          // solution away from the diagonal
+          if ((CurveType == PIP) && (fabs(point[0] - point[pntdim - 1]) < DYTOL))
+            {
+              // By definition during a PIP continuation no other parameter are at their ESS value, hence essParsDim = 0
+              // The NULL argument is only used to determine strongly convergence stability in the multi-dimensional CSS case.
+              retval = ESSclassify(pntdim, point, Equation, DYTOL, RHSTOL, R0ResIndex[PIPEVOIndex], &R0_xx, NULL, &R0_yy, &zCz, 1);
+              /*
+               * Notice that R0(E(x),y) with x and y the resident and mutant trait, respectively, can locally be approximated as:
+               *
+               * R0(E(x+dx),y+dy) = R0(E(x),y) + R0_x(E(x),y) dx + R0_y(E(x),y) dy + R0_xx(E(x),y)/2 dx^2 + R0_xy(E(x),y) dxdy + R0_yy(E(x),y)/2 dy^2 + h.o.t
+               *
+               * Because in equilibrium x=y=x* necessarily R0 = 1, both R0(E(x+dx),y+dy) and R0(E(x),y) equal 1
+               * (we are always in equilibrium!!!) and for the above relation to hold  it is also necessarily true that:
+               *
+               *      R0_x(E(x*),x*) + R0_y(E(x*),x*) = 0                               (1)
+               *
+               *  and
+               *
+               *      R0_xx(E(x*),x*) + 2 R0_xy(E(x*),x*) + R0_yy(E(x*),x*) = 0         (2)
+               *
+               *  Because we are in an evolutionary singularity, it moreover holds that:
+               *
+               *      R0_x(E(x*),x*) = - R0_y(E(x*),x*) = 0                             (3)
+               *
+               *  and
+               *
+               *      R0_xy(E(x*),x*) = -(R0_xx(E(x*),x*) + R0_yy(E(x*),x*))/2
+               *
+               *  Therefore,
+               *
+               *      R0_xx(E(x),y)/2 dx^2 + R0_xy(E(x),y) dxdy + R0_yy(E(x),y)/2 dy^2 = (R0_xx(E(x),y) dx - R0_yy(E(x),y) dy)(dx - dy)/2 = 0
+               *
+               *  Therefore, dy/dx = 1 (which is the diagonal) or dy/dx = R0_xx(E(x),y)/R0_yy(E(x),y), i.e.
+               *
+               *      dy = (R0_xx(E(x),y)/R0_yy(E(x),y)) dx
+               *
+               */
+              if ((retval == SUCCES) && R0_yy)
+                {
+                  tanvec[pntdim - 1] = zCz*tanvec[0];
+                }
+              else
+                {
+                  STDOUT("\nTangent vector element for mutant reversed to step away from the PIP diagonal\n\n");
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE)
+                  mexEvalString("pause(0.0001);");
+#elif (defined(R_PACKAGE))
+                  R_FlushConsole();
+                  R_ProcessEvents();
+#endif
+                  tanvec[pntdim - 1] = -tanvec[0];
+                }
+              hasjac = 0;
+            }
+        }
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE) || defined(R_PACKAGE)
+      if (checkInterrupt()) break;
+#endif
+
+      // Generate output: invoked after setting CurveEnd to allow for output of last solution point on branch
+      if (DoOutput)
+        {
+          // Output located point to stdout and output file
+          if (((pntnr + 1) % ReportLevel) == 0)
+            {
+              for (i = 0; i < pntdim; i++)
+                {
+#if (defined(R_PACKAGE))
+                  if (i) 
+                    STDOUT(",%15.8E", point[i]*pnt_scale[i]);
+                  else
+#endif
+                    STDOUT("%16.8E",  point[i]*pnt_scale[i]);          
+                }
+              STDOUT("\n");
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE)
+              mexEvalString("pause(0.0001);");
+#elif (defined(R_PACKAGE))
+              R_FlushConsole();
+              R_ProcessEvents();
+#endif
+            }
+
+          outmax = DefineOutput(point, Output);
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE) || defined(R_PACKAGE)
+          if (checkInterrupt()) break;
+#endif
+          if (outmax) PrettyPrintArray(outfile, outmax, Output);
+        }
+
+      // End the continuation at end of curve after generation of last output point
+      if (CurveEnd || DoSingle) break;
+
+      // Store all info on current solution point
+      COPY(pntdim, point, 1, oldpoint, 1);
+      COPY(pntdim, tanvec, 1, oldvec, 1);
+      COPY(EnvironDim, newEEC, 1, oldEEC, 1);
+      COPY(CurPopulationNr, newR0, 1, oldR0, 1);
+      COPY(ParameterNr*CurPopulationNr, newdR0dp[0], 1, olddR0dp[0], 1);
+
+      // Scale the point vector anew if necessary and redo the current point
+      if ((retval = SetScales(point, pntdim)))
+        {
+          ReportMsg("\n\nVariable %d rescaled!\n", retval);
+
+          // Compute the new tangent vector
+          // If the inner product with the previous tangent vector is negative,
+          // the direction has been reversed and is hence not preserved. Therefore,
+          // scale the tangent vector with a factor -1 to flip the direction.
+          retval = TangentVec(pntdim, point, Jacmat, tanvec, Equation, NULL, DYTOL);
+          hasjac = 1;
+          if (DOT(pntdim, oldvec, 1, tanvec, 1) < 0) SCAL(pntdim, -1, tanvec, 1);
+
+          Stepchange = DoOutput = 0;
+          TestBifs              = 0;
+        }
+      // Otherwise generate output and predict new point on the curve
+      else
+        {
+          Stepchange = DoOutput = 1;
+          TestBifs              = (CurveType == EQ) || (CurveType == ESS);
+
+          // Determine appropriate stepsize
+          ReportMsg("\nTangent vector in component   0: %.8G\n", tanvec[0]);
+          ReportMsg("Targeted  step in component   0: %.8G\n", curvestep*tanvec[0]/Stepreduce);
+
+          if ((Stepreduce == 1) && (fabs(curvestep) > fabs(Maxcurvestep))) curvestep = sign(curvestep)*fabs(Maxcurvestep);
+
+          AXPY(pntdim, (curvestep/Stepreduce), tanvec, 1, point, 1);
+
+          ReportMsg("Realized  step in component   0: %.8G\n", curvestep*tanvec[0]/Stepreduce);
+        }
+
+      // Prediction
+      ReportMsg("\n************************************************************************************************************\n");
+      ReportMsg("\nPrediction :\t");
+      for (i = 0; i < pntdim; i++) ReportMsg("%16.8E  ", point[i]*pnt_scale[i]);
+      ReportMsg("\n");
+
+      pntnr++;
+
+      fflush(NULL);
+#if defined(R_PACKAGE)
+      R_FlushConsole();
+      R_ProcessEvents();
+#endif
+    }
+
+  STDOUT("\n");
+#if (defined(R_PACKAGE))
+  R_FlushConsole();
+  R_ProcessEvents();
+#endif
+  FreeHeapMemory();
+
+  return;
+}
+
+
+/*==================================================================================================================================*/
+
+void InitialiseVars(void)
+
+{
+  int         i;
+
+#if (defined(_MSC_VER) && (_MSC_VER < 1500)) || (defined(R_PACKAGE) && defined(_WIN32))
+  (void)_set_output_format(_TWO_DIGIT_EXPONENT);
+#endif
+
+  // Initialize some variables
+  errfile    = NULL;
+  outfile    = NULL;
+  Stepchange = 0;
+  Stepreduce = 1;
+  strcpy(runname, "");
+
+#if defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE) || defined(R_PACKAGE)
+  CtrlCPressed = 0;
+#endif
+
+  // Get the machine precisions
+  epsMach = dlamch("Epsilon");
+
+  MaxPntDim         = EnvironDim + PopulationNr + 1 + ParameterNr;
+  CurPopulationNr   = PopulationNr;
+  CohortDim         = IStateDim + 1;
+  PopDensCohortDim  = CohortDim;
+  essParsDim        = 0;
+
+  PopBPIndex        = -1;
+  EnvBPIndex        = -1;
+  Bifparone         = -1;
+  Bifpartwo         = -1;
+  setBifParVal      = 1;
+
+  PIPEVOIndex       = -1;
+  for (i = 0; i < ParameterNr; i++) PopEVOIndex[i] = -1;
+  for (i = 0; i < ParameterNr; i++) ParEVOIndex[i] = -1;
+  ParEVODim         = 0;
+
+  TestRun       = 0;
+  DoStateOutput = 0;
+  SortIndex     = 0;
+  ReportLevel   = 1;
+  DoSingle      = 0;
+  BPdetection   = 1;
+  LPdetection   = 1;
+  
+  CurveType         = UNDEFINED;
+  LocalizeType      = UNDEFINED;
+  
+  eVarPntr          = Evar;
+  birthRatePntr     = Beq;
+  parPntr           = parameter;
+  evoParsIndexPntr  = essParsIndex;
+    
+
+  memset(PopTrivEqui, 0, (PopulationNr + 1)*sizeof(int));
+  memset(EnvTrivEqui, 0, EnvironDim*sizeof(int));
+#if (ALLOWNEGATIVE)
+  for (i = 0; i < MaxPntDim; i++) pntmin[i] = -SAFETY*DBL_MAX;
+#else
+  for (i = 0; i < MaxPntDim; i++) pntmin[i] = 0.0;
+#endif
+  for (i = 0; i < MaxPntDim; i++) pntmax[i] = SAFETY*DBL_MAX;
+  for (i = 0; i < ParameterNr; i++) essParsIndex[i] = -1;
+  for (i = 0; i < ParameterNr; i++) essPopsIndex[i] = -1;
+
+
+  // The following variables can be modified by the user with optional #define statements 
+  LogMinSurvival      = log(MIN_SURVIVAL);
+  CohortNr            = COHORT_NR + 1;
+  
+  Jacobian_Min_Step   = JACOBIAN_MIN_STEP;
+  Jacobian_Step       = JACOBIAN_STEP;
+  Jacobian_Updates    = JACOBIAN_UPDATES;
+  FastNumerics        = FASTNUMERICS;
+
+  Odesolve_Init_Step  = ODESOLVE_INIT_STEP;
+  Odesolve_Fixed_Step = ODESOLVE_FIXED_STEP;
+  Odesolve_Min_Step   = ODESOLVE_MIN_STEP;
+  Odesolve_Max_Step   = ODESOLVE_MAX_STEP;
+  Odesolve_Abs_Err    = ODESOLVE_ABS_ERR;
+  Odesolve_Rel_Err    = ODESOLVE_REL_ERR;
+  Odesolve_Func_Tol   = ODESOLVE_FUNC_TOL;
+
+  Time                = 0;
+
+  return;
+}
+
+
+/*
+ *====================================================================================================================================
+ *  UNIX shell interface function main() and supporting functions.
+ *====================================================================================================================================
+ */
+
+#if !defined(MATLAB_MEX_FILE) && !defined(OCTAVE_MEX_FILE) && !defined(R_PACKAGE)
+
+static void Usage(char *progname)
+
+{
+  int   i;
+  char  tmpstr[MAX_STR_LEN];
+  char  bifstr[MAX_STR_LEN];
+  char  desc[MAX_STR_LEN];
+  char  varstr[MAX_STR_LEN];
+
+  switch (CurveType)
+    {
+      case BP:
+        strcpy(bifstr, "BP");
+        strcpy(desc, "Aim:\tContinuation of a transcritical bifurcation of a structured population\n\tas a function of two parameters");
+        break;
+      case EQ:
+        strcpy(bifstr, "EQ");
+        strcpy(desc, "Aim:\tContinuation of a non-trivial equilibrium of a structured population\n\tas a function of a single parameter");
+        break;
+      case BPE:
+        strcpy(bifstr, "BPE");
+        strcpy(desc, "Aim:\tContinuation of a transcritical bifurcation in one of the environment variables\n\t");
+        strcat(desc, "of a structured population as a function of two parameters.\n\tOnly works if the dynamics of the environment variable\n\tis "
+                     "linear in the variable itself");
+        break;
+      case LP:
+        strcpy(bifstr, "LP");
+        strcpy(desc, "Aim:\tContinuation of a saddle-node bifurcation of a structured population\n\tas a function of two parameters");
+        break;
+      case ESS:
+        strcpy(bifstr, "ESS"); //ESS is now copied to bifstr.
+        strcpy(desc, "Aim:\tContinuation of the ESS value(s) of life history parameter(s) for a structured population\n\tas a function of the first "
+                     "bifurcation parameter");
+        break;
+        case EBPC:
+          strcpy(bifstr, "EBPC"); //ESS is now copied to bifstr.
+          strcpy(desc, "Aim:\tContinuation of the ESS value(s) of life history parameter(s) where one of the ESS values changes from CSS to EBP (R0_yy = 0) for a structured population\n\tas a function of two "
+                       " parameters");
+          break;
+      case PIP:
+        strcpy(bifstr, "PIP");
+        strcpy(desc, "Aim:\tContinuation of the boundary in resident-mutant values of the first parameter (PIP)\n\twhere R0=1 for both the resident "
+                     "and mutant structured population");
+        break;
+      default:
+        strcpy(bifstr, "<Type>");
+        strcpy(desc, "Aim:\tContinuation of trivial or non-trivial equilibria, transcritical and saddle-node bifurcations\n\t");
+        strcat(desc, "of structured populations as well as transcritical bifurcation in one of its environment variables\n\tand evolutionary "
+                     "continuation as a function of one or two parameters");
+    }
+  if (CurveType == UNDEFINED)
+    strcpy(varstr, "<Initial values>");
+  else
+    {
+      strcpy(varstr, "Par.1");
+      for (i = 0; i < EnvironDim; i++)
+        {
+          if (CurveType == BPE)
+            {
+              if ((i == EnvBPIndex) || (EnvTrivEqui[i])) continue;
+            }
+          else if (EnvTrivEqui[i])
+            continue;
+          sprintf(tmpstr, " E[%d]", i);
+          strcat(varstr, tmpstr);
+        }
+      for (i = 0; i < PopulationNr; i++)
+        {
+          if (CurveType == BP)
+            {
+              if ((i == PopBPIndex) || (PopTrivEqui[i])) continue;
+            }
+          else if (PopTrivEqui[i])
+            continue;
+          sprintf(tmpstr, " b[%d]", i);
+          strcat(varstr, tmpstr);
+        }
+      if (CurveType == ESS)
+        strcat(varstr, " Par.2 ... Par.n");
+      else if (!(CurveType == EQ))
+        strcat(varstr, " Par.2");
+    }
+
+  fprintf(stderr, "Usage:\t%s [<options>] %s %s %s", progname, bifstr, varstr, "<max. parameter step> <index par.1> <min. par.1> <max. par.1>");
+  if (CurveType == UNDEFINED)
+    fprintf(stderr, " [<index par.2> <min. par.2> <max. par.2> ... <index par.n> <min. par.n> <max. par.n>]");
+  else if (CurveType == ESS)
+    fprintf(stderr, " <pop par.2> <index par.2> <min. par.2> <max. par.2> ... <pop par.n> <index par.n> <min. par.n> <max. par.n>");
+  else if (!(CurveType == EQ))
+    fprintf(stderr, " <index par.2> <min. par.2> <max. par.2>");
+  fprintf(stderr, "\n\n%s\n\n", desc);
+  if (CurveType == UNDEFINED) fprintf(stderr, "<Type>: Type of curve computation to be performed, either BP, EQ, LP, BPE, ESS or PIP\n\n");
+  fprintf(stderr, "Possible options are:\n\n");
+  fprintf(stderr, "\t-envBP   <index> : Index of environment variable, of which to continue the transcritical bifurcation\n");
+  fprintf(stderr, "\t-popBP   <index> : Index of structured population, of which to continue the transcritical bifurcation\n");
+  fprintf(stderr, "\t-popEVO  <index> : Index of structured population, for which to compute selection gradient or perform PIP continuation\n");
+  fprintf(stderr, "\t                   (can be used multiple times for EQ and ESS curves)\n");
+  fprintf(stderr, "\t-parEVO  <index> : Index of parameter to compute selection gradient for during EQ continuation\n");
+  fprintf(stderr, "\t                   (can be used multiple times for EQ and ESS curves)\n");
+  fprintf(stderr, "\t-envZE   <index> : Index of environment variable in trivial equilibrium (can be used multiple times)\n");
+  fprintf(stderr, "\t-popZE   <index> : Index of structured population in trivial equilibrium (can be used multiple times)\n");
+  fprintf(stderr, "\t-essPars <number>: Number of life history parameters of structured population at their ESS value\n");
+  fprintf(stderr, "\t-isort   <index> : Index of i-state variable to use as ruling variable for sorting the structured populations\n");
+  fprintf(stderr, "\t-report  <value> : Interval of reporting computed output to console. Minimum value of 1 implies output of every point.\n");
+  fprintf(stderr, "\t-noBP            : Do not check for branching points while computing equilibrium curves\n");
+  fprintf(stderr, "\t-noLP            : Do not check for limit points while computing equilibrium curves\n");
+  fprintf(stderr, "\t-single          : Only compute the first point of the solution curve, do not continue the curve\n");
+  fprintf(stderr, "\t-test            : Perform only a single integration over the life history, reporting dynamics of survival, R0,\n");
+  fprintf(stderr, "\t                   i-state and interaction variables\n");
+  fprintf(stderr, "\nThe value for -essPars defaults to 0 unless set on the command-line\n");
+  fprintf(stderr, "The values for -envBP, -popBP, -popEVO, -parEVO, -envZE and -popZE are undefined unless set on the command-line\n");
+
+  fprintf(stderr, "\n%s, Copyright (C) 2015, Andre M. de Roos, University of Amsterdam\n\n", progname);
+  fprintf(stderr, "This program comes with ABSOLUTELY NO WARRANTY; without even the implied warranty of\n");
+  fprintf(stderr, "MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public\n");
+  fprintf(stderr, "License (<http://www.gnu.org/philosophy/why-not-lgpl.html>) for more details\n\n");
+
+  exit(1);                                                                          // Only executed when in command-line mode
+
+  return;
+}
+
+
+/*==================================================================================================================================*/
+
+int main(int argc, char **argv) //this is for command line so I can ignore it for the R-package
+{
+  register int  i, j, k, pind, rind;
+  int           my_argc, popint, tmpint, cvfdone = 0;
+  double        minval, maxval;
+  char          **argpnt1 = NULL, **argpnt2 = NULL, *my_argv[argc];
+  char          *ch;
+  int           popevonr = 0, parevonr = 0;
+
+  PopulationNr = POPULATION_NR;
+  Stages       = STAGES;
+  IStateDim    = I_STATE_DIM;
+  EnvironDim   = ENVIRON_DIM;
+  InteractDim  = INTERACT_DIM;
+  ParameterNr  = PARAMETER_NR;
+
+  InitialiseVars();
+
+  //=========================== Process the command-line arguments ===================================================================
+  if (argc < 2) Usage(argv[0]);
+  
+  argpnt1 = argv;
+  argpnt2 = my_argv;
+  my_argc = 0;
+
+  // Store the program name
+  *argpnt2 =*argpnt1;
+  my_argc++;
+  argpnt1++;
+  argpnt2++;
+
+  while (*argpnt1)
+    {
+      if (!strcmp(*argpnt1, "-?") || !strcmp(*argpnt1, "--help"))
+        {
+          Usage(argv[0]);
+        }
+      else if (!strcmp(*argpnt1, "-envBP")) //compares strings.
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nIndex of environment variable for branching point continuation not specified!\n");
+              Usage(argv[0]);
+            }
+          tmpint = atoi(*argpnt1); //converts string to integer
+          if ((tmpint < 0) || (tmpint >= EnvironDim))
+            {
+              fprintf(stderr, "\nIndex of environment variable for branching point continuation (%d) not in the appropriate range (0 <= i < %d)!\n",
+                      tmpint, EnvironDim);
+              Usage(argv[0]);
+            }
+          if (EnvironmentType[tmpint] != PERCAPITARATE)
+            {
+              fprintf(stderr, "\nDynamics of environment variable %d not specified as PERCAPITARATE!\n", tmpint);
+              fprintf(stderr, "Branching point continuation not possible\n");
+              Usage(argv[0]);
+            }
+          EnvBPIndex = tmpint;
+        }
+      else if (!strcmp(*argpnt1, "-popBP"))
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nIndex of structured population for branching point continuation not specified!\n");
+              Usage(argv[0]);
+            }
+          tmpint = atoi(*argpnt1);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            {
+              fprintf(stderr, "\nIndex of structured population for branching point continuation (%d) not in the appropriate range (0 <= i < %d)!\n",
+                      tmpint, PopulationNr);
+              Usage(argv[0]);
+            }
+          PopBPIndex = tmpint;
+        }
+      else if (!strcmp(*argpnt1, "-popEVO"))
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nIndex of structured population for selection gradient computation or PIP continuation not specified!\n");
+              Usage(argv[0]);
+            }
+          tmpint = atoi(*argpnt1);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            {
+              fprintf(stderr, "\nIndex of structured population for selection gradient computation or PIP continuation (%d) not in the appropriate range (0 <= i < %d)!\n",
+                      tmpint, PopulationNr);
+              Usage(argv[0]);
+            }
+          if (!popevonr) PIPEVOIndex = tmpint;
+          PopEVOIndex[popevonr++] = tmpint; //Here the pop evo parameters are stored //IMP
+        }
+      else if (!strcmp(*argpnt1, "-parEVO"))
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nIndex of parameter to compute selection gradient for during EQ continuation not specified!\n");
+              Usage(argv[0]);
+            }
+          tmpint = atoi(*argpnt1);
+          if ((tmpint < 0) || (tmpint >= ParameterNr))
+            {
+              fprintf(stderr, "\nIndex of parameter to compute selection gradient for (%d) not in the appropriate range (0 <= i < %d)!\n", tmpint,
+                      ParameterNr);
+              Usage(argv[0]);
+            }
+          ParEVOIndex[parevonr++] = tmpint;
+        }
+      else if (!strcmp(*argpnt1, "-essPars"))
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nNo number specified for the number of life history parameters at their ESS values!\n");
+              Usage(argv[0]);
+            }
+          tmpint = atoi(*argpnt1);
+          if (tmpint <= 0)
+            {
+              fprintf(stderr, "\nNumber of life history parameters at their ESS values should be larger than 0!\n");
+              Usage(argv[0]);
+            }
+          essParsDim = tmpint; //Define essParsDim // Imp
+        }
+      else if (!strcmp(*argpnt1, "-envZE"))
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nNo index of environment variable in boundary (trivial) equilibrium specified!\n");
+              Usage(argv[0]);
+            }
+          tmpint = atoi(*argpnt1);
+          if ((tmpint < 0) || (tmpint >= EnvironDim))
+            {
+              fprintf(stderr, "\nIndex of environment variable in boundary (trivial) equilibrium (%d) not in the appropriate range (0 <= i < %d)!\n",
+                      tmpint, EnvironDim);
+              Usage(argv[0]);
+            }
+          if (EnvironmentType[tmpint] == GENERALODE)
+            {
+              fprintf(stderr, "\nDynamics of environment variable %d not specified as PERCAPITARATE or POPULATIONINTEGRAL!\n", tmpint);
+              fprintf(stderr, "Enforcing a boundary (zero-valued) equilibrium for it not possible\n");
+              Usage(argv[0]);
+            }
+          EnvTrivEqui[tmpint] = 1;
+        }
+      else if (!strcmp(*argpnt1, "-popZE"))
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nNo index of population in trivial equilibrium specified!\n");
+              Usage(argv[0]);
+            }
+          tmpint = atoi(*argpnt1);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            {
+              fprintf(stderr, "\nIndex of structured population in boundary (trivial) equilibrium (%d) not in the appropriate range (0 <= i < %d)!\n",
+                      tmpint, PopulationNr);
+              Usage(argv[0]);
+            }
+          PopTrivEqui[tmpint] = 1;
+        }
+      else if (!strcmp(*argpnt1, "-isort"))
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nNo index of i-state variable specified for argument -isort!\n");
+              Usage(argv[0]);
+            }
+          tmpint = atoi(*argpnt1);
+          if ((tmpint < 0) || (tmpint >= IStateDim))
+            {
+              fprintf(stderr, "\nIndex of i-state variable for sorting structured populations (%d) not in the appropriate range (0 <= i < %d)!\n",
+                      tmpint, IStateDim);
+              Usage(argv[0]);
+            }
+          SortIndex = tmpint;
+        }
+      else if (!strcmp(*argpnt1, "-report"))
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nNo index of i-state variable specified for argument -report!\n");
+              Usage(argv[0]);
+            }
+          tmpint = atoi(*argpnt1);
+          ReportLevel = max(tmpint, 1);
+        }
+      else if (!strcmp(*argpnt1, "-cvf"))
+        {
+          argpnt1++;
+          if (!*argpnt1)
+            {
+              fprintf(stderr, "\nName of CVF file not specified specified!\n");
+              Usage(argv[0]);
+            }
+          (void)strcpy(runname, *argpnt1);
+          if ((ch = strstr(runname, ".cvf"))) *ch = '\0';
+          cvfdone = ReadCvfFile(runname);
+          if (cvfdone != SUCCES)
+            {
+              fprintf(stderr, "CVF file %s not read\n", runname);
+              Usage(argv[0]);
+            }
+        }
+      else if ((!strcmp(*argpnt1, "-noBP")))
+        {
+          BPdetection = 0;
+        }
+      else if ((!strcmp(*argpnt1, "-noLP")))
+        {
+          LPdetection = 0;
+        }
+      else if ((!strcmp(*argpnt1, "-test")))
+        {
+          TestRun = 1;
+        }
+      else if ((!strcmp(*argpnt1, "-single")))
+        {
+          DoSingle = 1;
+        }
+      else if ((!strncmp(*argpnt1, "--", 2)))
+        {
+          fprintf(stderr, "\nUnknown command line option: %s\n", *argpnt1);
+          Usage(argv[0]);
+        }
+      else if ((!strncmp(*argpnt1, "-", 1)) && isalpha(*(*argpnt1 + 1)))
+        {
+          fprintf(stderr, "\nUnknown command line option: %s\n", *argpnt1);
+          Usage(argv[0]);
+        }
+      else
+        {
+          *argpnt2 =*argpnt1;
+          my_argc++;
+          argpnt2++;
+        }
+      argpnt1++;
+    }
+
+  if (!strcmp(*(my_argv + 1), "BP"))
+    {
+      pntdim    = 2 + EnvironDim + (PopulationNr - 1);
+      CurveType = BP;
+      strcpy(ContinuationString, *(my_argv + 1));
+      PopTrivEqui[PopBPIndex] = 0;
+      EnvBPIndex              = -1;
+    }
+  else if (!strcmp(*(my_argv + 1), "BPE"))
+    {
+      pntdim    = 2 + (EnvironDim - 1) + PopulationNr;
+      CurveType = BPE;
+      strcpy(ContinuationString, *(my_argv + 1));
+      EnvTrivEqui[EnvBPIndex] = 0;
+      PopBPIndex              = -1;
+    }
+  else if (!strcmp(*(my_argv + 1), "EQ"))
+    {
+      pntdim    = 1 + EnvironDim + PopulationNr;
+      CurveType = EQ;
+      strcpy(ContinuationString, *(my_argv + 1));
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(*(my_argv + 1), "LP"))
+    {
+      pntdim    = 2 + EnvironDim + PopulationNr;
+      CurveType = LP;
+      strcpy(ContinuationString, *(my_argv + 1));
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(*(my_argv + 1), "ESS"))
+    {
+      if (essParsDim <= 0)
+        {
+          fprintf(stderr, "\nNumber of life history parameters at their ESS values should be larger than 0! Define with option '-essPars'.\n");
+          Usage(argv[0]);
+        }
+      pntdim    = 1 + EnvironDim + PopulationNr + essParsDim;
+      CurveType = ESS;
+      strcpy(ContinuationString, *(my_argv + 1));
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(*(my_argv + 1), "PIP"))
+    {
+      pntdim                     = 2 + EnvironDim + PopulationNr + 1;
+      CurPopulationNr            = PopulationNr + 1;
+      PopTrivEqui[PopulationNr]  = 1;
+      CurveType                  = PIP;
+      strcpy(ContinuationString, *(my_argv + 1));
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else
+    Usage(my_argv[0]);
+
+  if (CurveType == PIP)
+    {
+      if  (PIPEVOIndex == -1)
+        {
+          fprintf(stderr, "\nSet the structured population index for PIP continuation (0 <= i < %d) using the 'popEVO' option!\n\n",
+                  PopulationNr);
+          Usage(argv[0]);
+        }
+    }
+  else if ((CurveType == BP) && (PopBPIndex == -1))
+    {
+      fprintf(stderr, "\nSet the structured population index for BP continuation (0 <= i < %d) using the 'popBP' option!\n\n", PopulationNr);
+      Usage(argv[0]);
+    }
+  else if ((CurveType == BPE) && (EnvBPIndex == -1))
+    {
+      fprintf(stderr, "\nSet the environmental variable index for BPE continuation (0 <= i < %d) using the 'envBP' option!\n\n", EnvironDim);
+      Usage(argv[0]);
+    }
+
+  // Determine the index of the environment variables and the birth rates of the structured populations in the
+  // the point vector. Also determine the index of the equilibrium conditions for the environment variables and
+  // the R0 values of the structured populations in the result vector
+  for (i = 0, pind = 1, rind = 0; i < EnvironDim; i++)
+    {
+      if (EnvTrivEqui[i])
+        {
+          pntdim--;
+          EnvPntIndex[i] = -1;
+        }
+      else
+        EnvPntIndex[i] = pind++;
+
+      if (EnvTrivEqui[i] && (i != EnvBPIndex))
+        EnvResIndex[i] = -1;
+      else
+        EnvResIndex[i] = rind++;
+    }
+  for (i = 0; i < CurPopulationNr; i++)
+    {
+      if (PopTrivEqui[i])
+        {
+          pntdim--;
+          PopPntIndex[i] = -1;
+        }
+      else
+        PopPntIndex[i] = pind++;
+
+      if (PopTrivEqui[i] && (i != PopBPIndex) && (i != PopulationNr))
+        R0ResIndex[i] = -1;
+      else
+        R0ResIndex[i] = rind++;
+    }
+
+  if ((CurveType == EQ) && (my_argc != pntdim + 6))
+    Usage(argv[0]);
+  else if ((CurveType == ESS) && (my_argc != pntdim + 6 + essParsDim*4))
+    Usage(argv[0]);
+  else if ((CurveType != EQ) && (CurveType != ESS) && (my_argc != pntdim + 9))
+    Usage(argv[0]);
+
+  // Map all initial values of the variables into the argument vector
+  memset((void *)initpnt, 0, pntdim*sizeof(double));
+  for (i = 0, j = 2; i < pntdim; i++, j++) initpnt[i] = atof(my_argv[j]);
+
+  // Map the next input value to the stepsize along the branch
+  Maxcurvestep = atof(my_argv[j++]);
+  curvestep    = Maxcurvestep;
+
+  for (i = 0; j < my_argc; i++)
+    {
+      if (i && (CurveType == ESS))  //after bifparone has been identified
+        {
+          popint = (int)floor(atof(my_argv[j++]) + MICRO);
+          if ((popint < 0) || (popint >= PopulationNr))
+            {
+              fprintf(stderr, "\nIndex of population for ESS parameter (%d) not in the appropriate range (0 <= i < %d)!\n\n", popint, PopulationNr);
+              Usage(argv[0]);
+            }
+        }
+      tmpint = (int)floor(atof(my_argv[j++]) + MICRO); //index of parameters [bifparone or ess]
+      if ((tmpint < 0) || (tmpint >= ParameterNr))
+        {
+          fprintf(stderr, "\nIndex of parameter (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint, ParameterNr);
+          Usage(argv[0]);
+        }
+      minval = atof(my_argv[j++]);  //min value of the parameter defined above
+      maxval = atof(my_argv[j++]);  //max value of the paramter defined above
+      if (minval >= maxval)
+        {
+          fprintf(stderr, "\nMinimum parameter bound (%G not smaller than maximum (%G)!\n\n", minval, maxval);
+          Usage(argv[0]);
+        }
+
+      if (!i)
+        {
+          Bifparone = tmpint;
+          pntmin[0] = minval;
+          pntmax[0] = maxval;
+          if (CurveType == EQ) break;
+          continue;
+        }
+
+      if (CurveType != ESS)
+        {
+          Bifpartwo          = tmpint;
+          pntmin[pntdim - 1] = minval;
+          pntmax[pntdim - 1] = maxval;
+          if (CurveType == PIP)
+            Bifpartwo = Bifparone;
+          else if (Bifpartwo == Bifparone)
+            {
+              fprintf(stderr, "\nIndex of first and second bifurcation parameter the same!\nTwo parameter continuation not possible!\n");
+              Usage(argv[0]);
+            }
+          break;
+        }
+      else
+        {
+          if (i == 1) classifyESS = 1;
+          for (k = 0; k < (i - 1); k++)
+            {
+              if (popint != essPopsIndex[k])
+                {
+                  fprintf(stderr, "\nNB: ESS will not be classified because parameters at ESS value pertain to different populations!\n\n");
+                  classifyESS = 0;
+                }
+              if ((tmpint == essParsIndex[k]) || (tmpint == Bifparone))
+                {
+                  fprintf(stderr, "\nParameter at ESS value (%d) can not be specified twice or equal to bifurcation parameter!\n\n", tmpint);
+                  Usage(argv[0]);
+                }
+            }
+          essPopsIndex[i - 1] = popint;
+          essParsIndex[i - 1] = tmpint;
+          pntmin[pntdim - essParsDim + (i - 1)] = minval;
+          pntmax[pntdim - essParsDim + (i - 1)] = maxval;
+        }
+    }
+    
+
+
+  //============== Now curve type and bifurcation parameters are known process the ParEVOIndex and PopEVOIndex arrays ================
+
+  if ((CurveType == EQ) || (CurveType == ESS))
+    {
+      if ((parevonr == 0) && popevonr)
+        {
+          // fprintf(stderr, "\nOption 'popEVO' specified without corresponding 'parEVO' option. Option 'parEVO' defaults to bifurcation parameter (%d)!\n\n", Bifparone);
+          ParEVOIndex[0] = Bifparone;
+          ParEVODim = 1;
+        }
+      else ParEVODim = parevonr;
+      if (popevonr < ParEVODim)
+        fprintf(stderr, "\nFewer 'popEVO' than 'parEVO' options specified. Last %d evolutionary parameters assumed to pertain to population 0!\n\n", (ParEVODim - popevonr));
+      else if (popevonr > ParEVODim)
+        fprintf(stderr, "\nMore 'popEVO' than 'parEVO' options specified. Last %d 'popEVO' options ignored!\n\n", (popevonr - ParEVODim));
+      for (i = popevonr;  i < ParEVODim;    i++) PopEVOIndex[i]  = 0;
+      for (i = ParEVODim; i < ParameterNr;  i++) PopEVOIndex[i]  = -1;
+    }
+  else
+    {
+      for (i = 0; i < ParameterNr; i++) PopEVOIndex[i] = -1;
+      for (i = 0; i < ParameterNr; i++) ParEVOIndex[i] = -1;
+      ParEVODim = 0;
+    }
+
+  parameter[Bifparone] = initpnt[0];
+  if ((CurveType == BP) || (CurveType == LP) || (CurveType == BPE))
+    parameter[Bifpartwo] = initpnt[pntdim - 1];
+  else if (CurveType == ESS)
+    {
+      for (j = 0; j < essParsDim; j++) parameter[essParsIndex[j]] = initpnt[pntdim - essParsDim + j];
+    }
+
+  ComputeCurve(argc, argv);
+
+  return 0;
+}
+
+
+/*
+ *====================================================================================================================================
+ *  Matlab interface and exit/cleanup function
+ *====================================================================================================================================
+ */
+
+#elif defined(MATLAB_MEX_FILE) || defined(OCTAVE_MEX_FILE)
+
+#if defined(MATLAB_MEX_FILE)
+#include "mat.h"
+
+extern MATFile                    *pmat;
+#endif
+
+static void CloseStreams(void)
+{
+  if (biffile) fclose(biffile);
+  if (errfile) fclose(errfile);
+  if (outfile) fclose(outfile);
+#if defined(MATLAB_MEX_FILE) && (FULLSTATEOUTPUT > 0)
+  if (pmat) matClose(pmat);
+#endif
+
+  ResetCurve();
+  FreeHeapMemory();
+
+  return;
+}
+
+
+void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
+{
+  size_t        nrows, ncols;
+  double        *curveVals, tmpdouble, minval, maxval;
+  int           popint, tmpint, pind, rind, irhs;
+  const mxArray *cell_element_ptr;
+  char          optname[MAX_STR_LEN], optval[MAX_STR_LEN], tmpstr[MAX_STR_LEN], varstr[MAX_STR_LEN];
+
+  mwIndex       i, j, k;
+  size_t        total_num_of_cells, buflen;
+  int           status;
+  int           popevonr = 0, parevonr = 0;
+
+  PopulationNr = POPULATION_NR;
+  Stages       = STAGES;
+  IStateDim    = I_STATE_DIM;
+  EnvironDim   = ENVIRON_DIM;
+  InteractDim  = INTERACT_DIM;
+  ParameterNr  = PARAMETER_NR;
+
+  InitialiseVars();
+
+  // check for proper number of arguments
+  if (nrhs != 6)
+    mexErrMsgIdAndTxt(
+        "MATLAB:PSPMequi:nrhs",
+        "\nIncorrect number of command-line arguments.\n\nUse: %s(%s)\n\n%12s: %s\n%12s: %s\n%12s: %s\n%12s: %s\n%12s: %s\n%12s: %s\n%12s: %s",
+        mexFunctionName(), "<type>, <point>, <step size>, <curve settings>, <parameters>, <options>", "<type>",
+        "Type of bifurcation to perform (BP, BPE, EQ, LP, ESS or PIP)", "<point>", "Initial point of the bifurcation", "<step size>",
+        "Step size along bifurcation curve", "<curve settings>", "Index, minimum and maximum value for the variable parameters (n*3 values)",
+        "<parameters>", "Array of parameter values to use (empty array or of same length as parameter array)", "<options>",
+        "Possible bifurcation options: envBP, popBP, popEVO, parEVO, envZE, popZE, isort, noBP, noLP, single or test");
+
+  // check for proper number of output variables
+  if (nlhs != 1) mexErrMsgIdAndTxt("MATLAB:PSPMequi:nlhs", "A single output argument is required.");
+
+#if (MFUNCTIONS == 1)
+  Minterface_Init();
+#endif
+
+  //============================== Process the options argument ======================================================================
+  // Extract the contents of MATLAB cell into the C array
+  irhs = 5;
+  if (!mxIsCell(prhs[irhs])) mexErrMsgIdAndTxt("MATLAB:PSPMequi:options", "\nOptions should be specified as a cell array!\n");
+
+  total_num_of_cells = mxGetNumberOfElements(prhs[irhs]);
+  strcpy(optstring, "{");
+  for (i = 0; i < total_num_of_cells; i++)
+    {
+      cell_element_ptr = mxGetCell(prhs[irhs], i);
+      buflen           = mxGetN(cell_element_ptr)*sizeof(mxChar) + 1;
+      status           = mxGetString(cell_element_ptr, optname, buflen);
+      if (!((!strcmp(optname, "envBP")) || (!strcmp(optname, "popBP")) || (!strcmp(optname, "popEVO")) || (!strcmp(optname, "parEVO")) ||
+            (!strcmp(optname, "envZE")) || (!strcmp(optname, "popZE")) || (!strcmp(optname, "isort")) || (!strcmp(optname, "noBP")) ||
+            (!strcmp(optname, "noLP")) || (!strcmp(optname, "single")) || (!strcmp(optname, "test")) || (!strcmp(optname, "report"))))
+        mexErrMsgIdAndTxt("MATLAB:PSPMequi:options", "\nIllegal option %s!\n", optname);
+
+      if (!strcmp(optname, "noBP") || !strcmp(optname, "noLP") || !strcmp(optname, "single") || !strcmp(optname, "test"))
+        {
+          if (!strcmp(optname, "noBP")) BPdetection = 0;
+          if (!strcmp(optname, "noLP")) LPdetection = 0;
+          if (!strcmp(optname, "single")) DoSingle  = 1;
+          if (!strcmp(optname, "test")) TestRun     = 1;
+
+          // optstring still equal to "{"
+          if (strlen(optstring) == 1)
+            strcat(optstring, "'");
+          else
+            strcat(optstring, ", '");
+          strcat(optstring, optname);
+          strcat(optstring, "'");
+          continue;
+        }
+
+      if (!(++i < total_num_of_cells)) mexErrMsgIdAndTxt("MATLAB:PSPMequi:options", "\nNo value specified for option %s!\n", optname);
+
+      cell_element_ptr = mxGetCell(prhs[irhs], i);
+      buflen           = mxGetN(cell_element_ptr)*sizeof(mxChar) + 1;
+      status           = mxGetString(cell_element_ptr, optval, buflen);
+      if (status) mexErrMsgIdAndTxt("MATLAB:PSPMequi:options", "\nError in retrieving value for option %s!\n", optname);
+
+      // optstring still equal to "{"
+      if (strlen(optstring) == 1)
+        strcat(optstring, "'");
+      else
+        strcat(optstring, ", '");
+      strcat(optstring, optname);
+      strcat(optstring, "', '");
+      strcat(optstring, optval);
+      strcat(optstring, "'");
+
+      if (!strcmp(optname, "envBP"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= EnvironDim))
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                              "\nIndex of environment variable for branching point continuation (%d) not in the appropriate range (0 <= i < %d)!\n",
+                              tmpint, EnvironDim);
+          if (EnvironmentType[tmpint] != PERCAPITARATE)
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:options", "\nDynamics of environment variable %d not specified as PERCAPITARATE!\n%s", tmpint,
+                              "Branching point continuation not possible\n");
+          EnvBPIndex = tmpint;
+        }
+      else if (!strcmp(optname, "popBP"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                              "\nIndex of structured population for branching point continuation (%d) not in the appropriate range (0 <= i < %d)!\n",
+                              tmpint, PopulationNr);
+          PopBPIndex = tmpint;
+        }
+      else if (!strcmp(optname, "popEVO"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                              "\nIndex of structured population for selection gradient computation or PIP continuation (%d) not in the appropriate range (0 <= i < %d)!\n",
+                              tmpint, PopulationNr);
+          if (!popevonr) PIPEVOIndex = tmpint;
+          PopEVOIndex[popevonr++] = tmpint;
+        }
+      else if (!strcmp(optname, "parEVO"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= ParameterNr))
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                              "\nIndex of parameter to compute selection gradient for (%d) not in the appropriate range (0 <= i < %d)!\n", tmpint,
+                              ParameterNr);
+          ParEVOIndex[parevonr++] = tmpint;
+        }
+      else if (!strcmp(optname, "envZE"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= EnvironDim))
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                              "\nIndex of environment variable in boundary (trivial) equilibrium (%d) not in the appropriate range (0 <= i < %d)!\n",
+                              tmpint, EnvironDim);
+          if (EnvironmentType[tmpint] == GENERALODE)
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                              "\nDynamics of environment variable %d not specified as PERCAPITARATE or POPULATIONINTEGRAL!\n%s", tmpint,
+                              "Enforcing a boundary (zero-valued) equilibrium for it not possible\n");
+          EnvTrivEqui[tmpint] = 1;
+        }
+      else if (!strcmp(optname, "popZE"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                              "\nIndex of structured population in boundary (trivial) equilibrium (%d) not in the appropriate range (0 <= i < %d)!\n",
+                              tmpint, PopulationNr);
+          PopTrivEqui[tmpint] = 1;
+        }
+      else if (!strcmp(optname, "isort"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= IStateDim))
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                              "\nIndex of i-state variable for sorting structured populations (%d) not in the appropriate range (0 <= i < %d)!\n",
+                              tmpint, IStateDim);
+          SortIndex = tmpint;
+        }
+      else if (!strcmp(optname, "report"))
+        {
+          tmpint = atoi(optval);
+          ReportLevel = max(tmpint, 1);
+        }
+    }
+  strcat(optstring, "}");
+
+  //============================== Process the bifurcation type argument =============================================================
+  // Input must be a string
+  irhs = 0;
+  if ((mxIsChar(prhs[irhs]) != 1) || (mxGetM(prhs[irhs]) != 1))
+    mexErrMsgIdAndTxt("MATLAB:PSPMequi:inputNotString", "Bifurcation type must be a string (BP, BPE, EQ, LP, ESS or PIP).\n\n");
+
+  // Copy the string data from prhs[irhs] into a C string input_ buf.
+  strcpy(ContinuationString, mxArrayToString(prhs[irhs]));
+  if (!((!strcmp(ContinuationString, "BP")) || (!strcmp(ContinuationString, "BPE")) || (!strcmp(ContinuationString, "EQ")) ||
+        (!strcmp(ContinuationString, "LP")) || (!strcmp(ContinuationString, "ESS")) || (!strcmp(ContinuationString, "PIP"))))
+    mexErrMsgIdAndTxt("MATLAB:PSPMequi:inputNotString", "\nBifurcation type must be a string (BP, BPE, EQ, LP, ESS or PIP).\n\n");
+
+  if (!strcmp(ContinuationString, "BP"))
+    {
+      pntdim    = 2 + EnvironDim + (PopulationNr - 1);
+      CurveType = BP;
+      if (PopBPIndex == -1)
+        mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                          "\nSet the structured population index for BP continuation (0 <= i < %d) using the 'popBP' option!\n\n", PopulationNr);
+      PopTrivEqui[PopBPIndex] = 0;
+      EnvBPIndex              = -1;
+    }
+  else if (!strcmp(ContinuationString, "BPE"))
+    {
+      pntdim    = 2 + (EnvironDim - 1) + PopulationNr;
+      CurveType = BPE;
+      if (EnvBPIndex == -1)
+        mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                          "\nSet the environmental variable index for BPE continuation (0 <= i < %d) using the 'envBP' option!\n\n", EnvironDim);
+      EnvTrivEqui[EnvBPIndex] = 0;
+      PopBPIndex              = -1;
+    }
+  else if (!strcmp(ContinuationString, "EQ"))
+    {
+      pntdim     = 1 + EnvironDim + PopulationNr;
+      CurveType  = EQ;
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(ContinuationString, "LP"))
+    {
+      pntdim     = 2 + EnvironDim + PopulationNr;
+      CurveType  = LP;
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(ContinuationString, "ESS"))
+    {
+      pntdim     = 1 + EnvironDim + PopulationNr;                                 // Number of ESS parameters is added below
+      CurveType  = ESS;
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(ContinuationString, "PIP"))
+    {
+      pntdim                     = 2 + EnvironDim + PopulationNr + 1;
+      CurPopulationNr            = PopulationNr + 1;
+      PopTrivEqui[PopulationNr]  = 1;
+      CurveType                  = PIP;
+      PopBPIndex                 = -1;
+      EnvBPIndex                 = -1;
+    }
+
+  if ((CurveType == PIP) && (PIPEVOIndex == -1))
+    mexErrMsgIdAndTxt("MATLAB:PSPMequi:options",
+                      "\nSet the structured population index for PIP continuation (0 <= i < %d) using the 'popEVO' option!\n\n",
+                      PopulationNr);
+
+  // Determine the index of the environment variables and the birth rates of the structured populations in the
+  // the point vector. Also determine the index of the equilibrium conditions for the environment variables and
+  // the R0 values of the structured populations in the result vector
+  for (i = 0, pind = 1, rind = 0; i < EnvironDim; i++)
+    {
+      if (EnvTrivEqui[i])
+        {
+          pntdim--;
+          EnvPntIndex[i] = -1;
+        }
+      else
+        EnvPntIndex[i] = pind++;
+
+      if (EnvTrivEqui[i] && (i != EnvBPIndex))
+        EnvResIndex[i] = -1;
+      else
+        EnvResIndex[i] = rind++;
+    }
+  for (i = 0; i < CurPopulationNr; i++)
+    {
+      if (PopTrivEqui[i])
+        {
+          pntdim--;
+          PopPntIndex[i] = -1;
+        }
+      else
+        PopPntIndex[i] = pind++;
+
+      if (PopTrivEqui[i] && (i != PopBPIndex) && (i != PopulationNr))
+        R0ResIndex[i] = -1;
+      else
+        R0ResIndex[i] = rind++;
+    }
+
+  //============================== Process the parameters argument ===================================================================
+
+  irhs  = 4;
+  nrows = mxGetM(prhs[irhs]);
+  ncols = mxGetN(prhs[irhs]);
+  if ((ncols == ParameterNr) && (nrows == 1))
+    memcpy(parameter, mxGetPr(prhs[irhs]), ncols*mxGetElementSize(prhs[irhs]));
+  else if (ncols)
+    mexWarnMsgIdAndTxt("MATLAB:PSPMequi:parameters", "\nParameter argument ignored as it is not a row vector of length %d\n", ParameterNr);
+
+  total_num_of_cells = mxGetNumberOfElements(prhs[irhs]);
+  strcpy(parstring, "[");
+  for (i = 0; i < total_num_of_cells; i++)
+    {
+      if (i) strcat(parstring, " ");
+      memcpy(&tmpdouble, mxGetPr(prhs[irhs]) + i, mxGetElementSize(prhs[irhs]));
+      sprintf(tmpstr, "%.6G", tmpdouble);
+      strcat(parstring, tmpstr);
+    }
+  strcat(parstring, "]");
+
+  //============================== Process the step size argument ====================================================================
+
+  irhs  = 2;
+  nrows = mxGetM(prhs[irhs]);
+  ncols = mxGetN(prhs[irhs]);
+  if ((ncols != 1) || (nrows != 1))
+    mexErrMsgIdAndTxt("MATLAB:PSPMequi:stepsize", "\nStep size along bifurcation curve must be a single double value.\n");
+
+  memcpy(&Maxcurvestep, mxGetPr(prhs[irhs]), ncols*mxGetElementSize(prhs[irhs]));
+  curvestep = Maxcurvestep;
+
+  //============================== Process the curve parameters argument =============================================================
+
+  irhs  = 3;
+  nrows = mxGetM(prhs[irhs]);
+  ncols = mxGetN(prhs[irhs]);
+
+  if (CurveType == EQ)
+    {
+      if (ncols != 3) mexErrMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nCurve argument must be a row vector of length 3 for EQ continuation.\n\n");
+    }
+  else if (CurveType == ESS)
+    {
+      if ((ncols < 4) || ((ncols - 3) % 4))
+        mexErrMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nCurve argument must be a row vector of length 3+4*N for ESS continuation, ",
+                          "each of the N sets consisting of population number, index, minimum and maximum of the parameter.\n\n");
+    }
+  else if (ncols != 6)
+    mexErrMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nCurve argument must be a row vector of length 6 for BP, BPE, LP and PIP continuation.\n\n");
+
+  curveVals = mxGetPr(prhs[irhs]);
+  for (i = 0, j = 0; j < ncols; i++)
+    {
+      if (i && (CurveType == ESS))
+        {
+          popint = (int)floor(curveVals[j++] + MICRO);
+          if ((popint < 0) || (popint >= PopulationNr))
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nIndex of population for ESS parameter (%d) not in the appropriate range (0 <= i < %d)!\n\n", popint, PopulationNr);
+        }
+      tmpint = (int)floor(curveVals[j++] + MICRO);
+      if ((tmpint < 0) || (tmpint >= ParameterNr))
+        mexErrMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nIndex of parameter (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint, ParameterNr);
+
+      minval = curveVals[j++];
+      maxval = curveVals[j++];
+      if (minval >= maxval)
+        mexErrMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nMinimum parameter bound (%G not smaller than maximum (%G)!\n\n", minval, maxval);
+      if (!i)
+        {
+          Bifparone = tmpint;
+          pntmin[0] = minval;
+          pntmax[0] = maxval;
+          continue;
+        }
+      if (CurveType != ESS)
+        {
+          Bifpartwo = tmpint;
+          pntmin[pntdim - 1] = minval;
+          pntmax[pntdim - 1] = maxval;
+          if (CurveType == PIP)
+            Bifpartwo = Bifparone;
+          else if (Bifpartwo == Bifparone)
+            mexErrMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nIndex of first and second bifurcation parameter the same!\nTwo parameter continuation not possible!\n");
+          break;
+        }
+      else
+        {
+          if (i == 1) classifyESS = 1;
+          for (k = 0; k < essParsDim; k++)
+            {
+              if (popint != essPopsIndex[k])
+                {
+                  //mexWarnMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nNB: ESS will not be classified because parameters at ESS value pertain to different populations!\n\n");
+                  //classifyESS = 0;
+                    mexWarnMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nNB: ESS will  be classified but parameters at ESS value pertain to different populations!\n\n");
+                    classifyESS = 1;
+                }
+              if ((tmpint == essParsIndex[k]) || (tmpint == Bifparone))
+                mexErrMsgIdAndTxt("MATLAB:PSPMequi:bounds", "\nParameter at ESS value (%d) can not be specified twice or equal to bifurcation parameter!\n\n", tmpint);
+            }
+          essPopsIndex[essParsDim] = popint;
+          essParsIndex[essParsDim] = tmpint;
+          pntmin[pntdim] = minval;
+          pntmax[pntdim] = maxval;
+          essParsDim++;
+          pntdim++;
+        }
+    }
+
+  strcpy(curvestring, "[");
+  for (i = 0; i < (nrows*ncols); i++)
+    {
+      if (i) strcat(curvestring, " ");
+      sprintf(tmpstr, "%.6G", curveVals[i]);
+      strcat(curvestring, tmpstr);
+    }
+  strcat(curvestring, "]");
+
+  //============== Now curve type and bifurcation parameters are known process the ParEVOIndex and PopEVOIndex arrays ================
+
+  if ((CurveType == EQ) || (CurveType == ESS))
+    {
+      if ((parevonr == 0) && popevonr)
+        {
+          // mexWarnMsgIdAndTxt("MATLAB:PSPMequi:options", "\nOption 'popEVO' specified without corresponding 'parEVO' option. Option 'parEVO' defaults to bifurcation parameter (%d)!\n\n", Bifparone);
+          ParEVOIndex[0] = Bifparone;
+          ParEVODim = 1;
+        }
+      else ParEVODim = parevonr;
+      if (popevonr < ParEVODim)
+        mexWarnMsgIdAndTxt("MATLAB:PSPMequi:options", "\nFewer 'popEVO' than 'parEVO' options specified. Last %d evolutionary parameters assumed to pertain to population 0!\n\n", (ParEVODim - popevonr));
+      else if (popevonr > ParEVODim)
+        mexWarnMsgIdAndTxt("MATLAB:PSPMequi:options", "\nMore 'popEVO' than 'parEVO' options specified. Last %d 'popEVO' options ignored!\n\n", (popevonr - ParEVODim));
+      for (i = popevonr;  i < ParEVODim;    i++) PopEVOIndex[i]  = 0;
+      for (i = ParEVODim; i < ParameterNr;  i++) PopEVOIndex[i]  = -1;
+    }
+  else
+    {
+      for (i = 0; i < ParameterNr; i++) PopEVOIndex[i] = -1;
+      for (i = 0; i < ParameterNr; i++) ParEVOIndex[i] = -1;
+      ParEVODim = 0;
+    }
+
+  //============================== Process the initial point argument ================================================================
+
+  irhs = 1;
+  memset((void *)initpnt, 0, pntdim*sizeof(double));
+  nrows = mxGetM(prhs[irhs]);
+  ncols = mxGetN(prhs[irhs]);
+  if ((nrows != 1) || (ncols != pntdim))
+    {
+      strcpy(varstr, "[ Par.1");
+      for (i = 0; i < EnvironDim; i++)
+        {
+          if (CurveType == BPE)
+            {
+              if ((i == EnvBPIndex) || (EnvTrivEqui[i])) continue;
+            }
+          else if (EnvTrivEqui[i])
+            continue;
+          sprintf(tmpstr, " E[%d]", (int)i);
+          strcat(varstr, tmpstr);
+        }
+      for (i = 0; i < PopulationNr; i++)
+        {
+          if (CurveType == BP)
+            {
+              if ((i == PopBPIndex) || (PopTrivEqui[i])) continue;
+            }
+          else if (PopTrivEqui[i])
+            continue;
+          sprintf(tmpstr, " b[%d]", (int)i);
+          strcat(varstr, tmpstr);
+        }
+      if (!(CurveType == EQ)) strcat(varstr, " Par.2");
+      strcat(varstr, " ]");
+      mexErrMsgIdAndTxt("MATLAB:PSPMequi:point", "\nInitial point for bifurcation must be a row vector of length %d:  %s\n", pntdim, varstr);
+    }
+  memcpy(initpnt, mxGetPr(prhs[irhs]), ncols*mxGetElementSize(prhs[irhs]));
+  parameter[Bifparone] = initpnt[0];
+
+  if ((CurveType == BP) || (CurveType == LP) || (CurveType == BPE))
+    parameter[Bifpartwo] = initpnt[pntdim - 1];
+  else if (CurveType == ESS)
+    {
+      for (j = 0; j < essParsDim; j++) parameter[essParsIndex[j]] = initpnt[pntdim - essParsDim + j];
+    }
+
+  strcpy(pntstring, "[");
+  for (i = 0; i < (nrows*ncols); i++)
+    {
+      if (i) strcat(pntstring, " ");
+      sprintf(tmpstr, "%.6G", initpnt[i]);
+      strcat(pntstring, tmpstr);
+    }
+  strcat(pntstring, "]");
+
+  //============================= Get the program name ===============================================================================
+  // Get the name of the mex file
+  strcpy(progname, mexFunctionName());
+  progname[strlen(progname) - 4] = '\0';                                            // Cut off the 'equi' appendix
+
+  mexAtExit(CloseStreams);
+
+  // call the computational routine
+  ComputeCurve(0, NULL);
+  FreeHeapMemory();
+
+  if (TestRun)
+    plhs[0] = mxCreateString("");
+  else
+    plhs[0] = mxCreateString(runname);
+
+#if (MFUNCTIONS == 1)
+  Minterface_End();
+#endif
+  
+  return;
+}
+
+
+/*
+ *====================================================================================================================================
+ *  R interface function
+ *====================================================================================================================================
+ */
+
+#elif defined(R_PACKAGE)
+
+SEXP PSPMequi(SEXP moduleName, SEXP bifType, SEXP initVals, SEXP stepsize, SEXP curveVals, SEXP parVals, SEXP optVals)
+
+{
+  int     i, j, k, ncols, popint, tmpint, pind, rind;
+  char    optname[MAX_STR_LEN], optval[MAX_STR_LEN], tmpstr[MAX_STR_LEN], varstr[MAX_STR_LEN];
+  double  minval, maxval;
+  SEXP    resfil;
+  int     popevonr = 0, parevonr = 0;
+
+
+  PopulationNr = POPULATION_NR;
+  Stages       = STAGES;
+  IStateDim    = I_STATE_DIM;
+  EnvironDim   = ENVIRON_DIM;
+  InteractDim  = INTERACT_DIM;
+  ParameterNr  = PARAMETER_NR;
+
+  InitialiseVars();
+
+#if (RFUNCTIONS == 1)
+  Rinterface_Init();
+#endif
+
+  //============================== Process the options argument ======================================================================
+
+  if (length(optVals) && (!isString(optVals)))
+    error("\nOptions should either be specified as NULL or as a vector of strings\n\n");
+  strcpy(optstring, "");
+  
+  ncols =length(optVals);
+  for (i = 0; i < ncols; i++)
+    {
+      strcpy(optname, CHAR(STRING_ELT(optVals, i)));
+        if (!((!strcmp(optname, "envBP")) || (!strcmp(optname, "popBP")) || (!strcmp(optname, "popEVO")) || (!strcmp(optname, "parEVO")) || (!strcmp(optname, "maxESS")) ||
+            (!strcmp(optname, "envZE")) || (!strcmp(optname, "popZE")) || (!strcmp(optname, "isort")) || (!strcmp(optname, "noBP")) || (!strcmp(optname, "popEBP")) ||
+            (!strcmp(optname, "noLP")) || (!strcmp(optname, "single")) || (!strcmp(optname, "test")) || (!strcmp(optname, "report"))))
+        error("\nIllegal option %s!\n\n", optname);
+
+      if (!strcmp(optname, "noBP") || !strcmp(optname, "noLP") || !strcmp(optname, "single") || !strcmp(optname, "test"))
+        {
+          if (!strcmp(optname, "noBP")) BPdetection = 0;
+          if (!strcmp(optname, "noLP")) LPdetection = 0;
+          if (!strcmp(optname, "single")) DoSingle  = 1;
+          if (!strcmp(optname, "test")) TestRun     = 1;
+
+          if (!strlen(optstring))
+            strcpy(optstring, "c(\"");
+          else
+            strcat(optstring, ", \"");
+          strcat(optstring, optname);
+          strcat(optstring, "\"");
+          continue;
+        }
+
+      if (!(++i < ncols)) error("\nNo value specified for option %s!\n\n", optname);
+
+      strcpy(optval, CHAR(STRING_ELT(optVals, i)));
+      
+      // optstring still equal to ""
+      if (!strlen(optstring))
+        strcpy(optstring, "c(\"");
+      else
+        strcat(optstring, ", \"");
+      strcat(optstring, optname);
+      strcat(optstring, "\", \"");
+      strcat(optstring, optval);
+      strcat(optstring, "\"");
+
+      if (!strcmp(optname, "envBP"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= EnvironDim))
+            error("\nIndex of environment variable for branching point continuation (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint,
+                  EnvironDim);
+          if (EnvironmentType[tmpint] == GENERALODE)
+            error("\nDynamics of environment variable %d not specified as PERCAPITARATE or POPULATIONINTEGRAL!\n%s", tmpint,
+                  "Enforcing a boundary (zero-valued) equilibrium for it not possible\n");
+          EnvBPIndex = tmpint;
+        }
+      else if (!strcmp(optname, "popBP"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            error("\nIndex of structured population for branching point continuation (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint,
+                  PopulationNr);
+          PopBPIndex = tmpint;
+        }
+        else if (!strcmp(optname, "maxESS"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint > PopulationNr))
+            error("\nnumber of populations to calculate ESS-for not in range (0 <= i < %d)!\n\n", tmpint,
+                  PopulationNr);
+          maxESS = tmpint; //for how many populations the ESS should be classified
+        }
+        
+      else if (!strcmp(optname, "popEVO"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            error("\nIndex of structured population for selection gradient computation or PIP continuation (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint,
+                  PopulationNr);
+          if (!popevonr) PIPEVOIndex = tmpint;
+          PopEVOIndex[popevonr++] = tmpint;
+        }
+      else if (!strcmp(optname, "popEBP"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            error("\nIndex of structured population for EBP continuation (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint,
+                  PopulationNr);
+            fprintf(stderr, "The index of the structured pop to continue the EBP is %d\n", tmpint);
+          EBPIndex = tmpint; //Get the population of which to continue the EBP
+        }
+      else if (!strcmp(optname, "parEVO"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= ParameterNr))
+            error("\nIndex of parameter to compute selection gradient for (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint,
+                  ParameterNr);
+          ParEVOIndex[parevonr++] = tmpint;
+        }
+      else if (!strcmp(optname, "envZE"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= EnvironDim))
+            error("\nIndex of environment variable in boundary (trivial) equilibrium (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint,
+                  EnvironDim);
+          if (EnvironmentType[tmpint] == GENERALODE)
+            error("\nDynamics of environment variable %d not specified as PERCAPITARATE or POPULATIONINTEGRAL!\n%s", tmpint,
+                  "Enforcing a boundary (zero-valued) equilibrium for it not possible\n\n");
+          EnvTrivEqui[tmpint] = 1;
+        }
+      else if (!strcmp(optname, "popZE"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= PopulationNr))
+            error("\nIndex of structured population in boundary (trivial) equilibrium (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint,
+                  PopulationNr);
+          PopTrivEqui[tmpint] = 1;
+        }
+      else if (!strcmp(optname, "isort"))
+        {
+          tmpint = atoi(optval);
+          if ((tmpint < 0) || (tmpint >= IStateDim))
+            error("\nIndex of i-state variable for sorting structured populations (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint,
+                  IStateDim);
+          SortIndex = tmpint;
+        }
+      else if (!strcmp(optname, "report"))
+        {
+          tmpint = atoi(optval);
+          ReportLevel = max(tmpint, 1);
+        }
+    }
+
+  if (strlen(optstring))
+    strcat(optstring, ")");
+  else
+    strcpy(optstring, "NULL");
+
+  //============================== Process the bifurcation type argument =============================================================
+
+  // Get the name of the module file
+  if ((!isString(bifType)) || (length(moduleName) != 1))
+    error("\nBifurcation type must be a single string\n\n");
+
+  strcpy(ContinuationString, CHAR(STRING_ELT(bifType, 0)));
+  
+  if (!((!strcmp(ContinuationString, "BP")) || (!strcmp(ContinuationString, "BPE")) || (!strcmp(ContinuationString, "EQ")) ||
+        (!strcmp(ContinuationString, "LP")) || (!strcmp(ContinuationString, "ESS")) ||
+        (!strcmp(ContinuationString, "EBPC")) ||
+        (!strcmp(ContinuationString, "PIP"))))
+    error("\nBifurcation type must be a string (BP, BPE, EQ, LP, ESS, EBPC or PIP).\n\n");
+
+  if (!strcmp(ContinuationString, "BP"))
+    {
+      pntdim    = 2 + EnvironDim + (PopulationNr - 1);
+      CurveType = BP;
+      if (PopBPIndex == -1)
+        error("\nSet the structured population index for BP continuation (0 <= i < %d) using the 'popBP' option!\n\n", PopulationNr);
+      PopTrivEqui[PopBPIndex] = 0;
+      EnvBPIndex              = -1;
+    }
+  else if (!strcmp(ContinuationString, "BPE"))
+    {
+      pntdim    = 2 + (EnvironDim - 1) + PopulationNr;
+      CurveType = BPE;
+      if (EnvBPIndex == -1)
+        error("\nSet the environmental variable index for BPE continuation (0 <= i < %d) using the 'envBP' option!\n\n", EnvironDim);
+      EnvTrivEqui[EnvBPIndex] = 0;
+      PopBPIndex              = -1;
+    }
+  else if (!strcmp(ContinuationString, "EQ"))
+    {
+      pntdim     = 1 + EnvironDim + PopulationNr;
+      CurveType  = EQ;
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(ContinuationString, "LP"))
+    {
+      pntdim     = 2 + EnvironDim + PopulationNr;
+      CurveType  = LP;
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(ContinuationString, "ESS"))
+    {
+      pntdim     = 1 + EnvironDim + PopulationNr;                                   // Number of ESS parameters is added below
+      CurveType  = ESS;
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(ContinuationString, "EBPC")) //NEW to continue R0_yy = 0
+    {
+      pntdim     = 2 + EnvironDim + PopulationNr;                                   // Number of ESS parameters is added below
+      CurveType  = EBPC;
+      PopBPIndex = -1;
+      EnvBPIndex = -1;
+    }
+  else if (!strcmp(ContinuationString, "PIP"))
+    {
+      pntdim                     = 2 + EnvironDim + PopulationNr + 1;
+      CurPopulationNr            = PopulationNr + 1;
+      PopTrivEqui[PopulationNr]  = 1;
+      CurveType                  = PIP;
+      PopBPIndex                 = -1;
+      EnvBPIndex                 = -1;
+    }
+
+  if ((CurveType == PIP) && (PIPEVOIndex == -1))
+    error("\nSet the structured population index for PIP continuation (0 <= i < %d) using the 'popEVO' option!\n\n", PopulationNr);
+
+  // Determine the index of the environment variables and the birth rates of the structured populations in the
+  // the point vector. Also determine the index of the equilibrium conditions for the environment variables and
+  // the R0 values of the structured populations in the result vector
+  for (i = 0, pind = 1, rind = 0; i < EnvironDim; i++) //set the environmental indeces
+    {
+      if (EnvTrivEqui[i])
+        {
+          pntdim--;
+          EnvPntIndex[i] = -1;
+        }
+      else
+        EnvPntIndex[i] = pind++;
+
+      if (EnvTrivEqui[i] && (i != EnvBPIndex))
+        EnvResIndex[i] = -1;
+      else
+        EnvResIndex[i] = rind++;
+    }
+  for (i = 0; i < CurPopulationNr; i++)
+    {
+      if (PopTrivEqui[i])
+        {
+          pntdim--;
+          PopPntIndex[i] = -1;
+        }
+      else
+        PopPntIndex[i] = pind++;
+
+      if (PopTrivEqui[i] && (i != PopBPIndex) && (i != PopulationNr))
+        R0ResIndex[i] = -1;
+      else
+        R0ResIndex[i] = rind++;
+    }
+
+  //============================== Process the parameters argument ===================================================================
+
+  ncols = length(parVals);
+  if (isReal(parVals) && (ncols == ParameterNr))
+    memcpy(parameter, REAL(parVals), ncols*sizeof(double));
+  else if (ncols)
+    warning("\nParameter argument ignored as it is not a row vector of appropriate length\n\n");
+
+  if (ncols)
+    {
+      strcpy(parstring, "c(");
+      for (i = 0; i < ncols; i++)
+        {
+          if (i) strcat(parstring, ", ");
+          sprintf(tmpstr, "%.6G", REAL(parVals)[i]);
+          strcat(parstring, tmpstr);
+        }
+      strcat(parstring, ")");
+    }
+  else
+    strcpy(parstring, "NULL");
+
+  //============================== Process the step size argument ====================================================================
+
+  if (isReal(stepsize) && (length(stepsize) == 1))
+    {
+      Maxcurvestep = REAL(stepsize)[0];
+      curvestep    = Maxcurvestep;
+    }
+  else
+    error("\nStep size argument should be a single, real value\n\n");
+
+  //============================== Process the curve parameters argument =============================================================
+
+    for (i = 0; i < POPULATION_NR; i++){
+        UniqueESSPops[i] = POPULATION_NR + 1; //what is this??? I think this can be removed?
+    }
+  
+    ncols = length(curveVals);
+  if (!isReal(curveVals) || (!length(curveVals)))
+    error("\nThe curve settings argument should be a vector of real values\n\n");
+
+  if (CurveType == EQ)
+    {
+      if (ncols != 3) error("\nCurve argument must be a row vector of length 3 for EQ continuation.\n\n");
+    }
+  else if (CurveType == ESS)
+    {
+      if ((ncols < 4) || ((ncols - 3) % 4))
+        error("\nCurve argument must be a row vector of length 3+4*N for ESS continuation, each of the N sets consisting of population number, index, minimum and maximum of the parameter.\n\n");
+    }
+   else if (CurveType == EBPC) //NEW continuation of R0_yy = 0
+    {
+        if ((ncols < 10) || ((ncols - 6) % 4))//if ((ncols < 8) || ((ncols - 7) % 4)) //werkt
+        error("\nCurve argument (%d) for EBP continuation must be a row vector of length 3(bifpar1)+3(bifpar2)+4*N, each of the N sets consisting of population number, index, minimum and maximum of the parameter. \n\n", ncols);
+    }
+  else if (ncols != 6)
+    error("\nCurve argument must be a row vector of length 6 for BP, BPE, LP and PIP continuation.\n\n");
+    
+    
+    
+    for (i = 0, j = 0; j < ncols; i++)
+    {
+        
+        if ((i) && (CurveType == ESS))
+        {
+            popint = (int)floor(REAL(curveVals)[j++] + MICRO); //number of the pop
+            if ((popint < 0) || (popint >= PopulationNr))
+                error("\nIndex of population for ESS parameter (%d) not in the appropriate range (0 <= i < %d)! i=%d j=%d\n\n", popint, PopulationNr, i, j);
+        }
+        if ((i > 1) && (CurveType == EBPC)) //to get ESS traits
+        {
+            popint = (int)floor(REAL(curveVals)[j++] + MICRO); //number of the pop
+            if ((popint < 0) || (popint >= PopulationNr))
+                error("\nIndex of population for ESS parameter in the EBP (%d) not in the appropriate range (0 <= i < %d)! i=%d j=%d\n\n", popint, PopulationNr, i, j);
+        }
+        tmpint = (int)floor(REAL(curveVals)[j++] + MICRO); //BIFPAR
+        
+        if ((tmpint < 0) || (tmpint >= ParameterNr))
+            error("\nIndex of parameter (%d) not in the appropriate range (0 <= i < %d)!\n\n", tmpint, ParameterNr);
+        minval = REAL(curveVals)[j++];
+        maxval = REAL(curveVals)[j++];
+        
+        if (minval >= maxval)
+            error("\nMinimum parameter bound (%G not smaller than maximum (%G)!\n\n", minval, maxval);
+        if (!i)
+        {
+            Bifparone = tmpint; //set first bifpar
+            pntmin[0] = minval; //set min and max
+            pntmax[0] = maxval;
+            continue;  ///Go next
+        }
+        if ((CurveType != ESS) && (CurveType != EBPC)) {
+            Bifpartwo = tmpint;
+            pntmin[pntdim - 1] = minval;
+            pntmax[pntdim - 1] = maxval;
+            if (CurveType == PIP)
+                Bifpartwo = Bifparone;
+            else if (Bifpartwo == Bifparone)
+                error("\nIndex of first and second bifurcation parameter the same!\nTwo parameter continuation not possible!\n");
+            break;
+        }
+        else if ((CurveType == EBPC) && (i == 1)) { //NEW second bifpar in case of EBPC cont
+            Bifpartwo = tmpint;
+            pntmin[pntdim - 1] = minval;
+            pntmax[pntdim - 1] = maxval;
+            continue;
+        }
+        else if (CurveType == ESS) {
+            if (i == 1) {
+                classifyESS = 1;
+                UniqueESSPops[0] = popint; //Start initializing the vector with evolving pops
+            }  else if (i > 1 & Unique < maxESS) {  //GET THE NUMBER OF EVOLVING POPULATIONS
+                int count = 0;
+                for (p = 0; p < Unique; p++) { //check if the parameter belongs to an existing populatin or not
+                    fprintf(stderr, "\n p is %d and i is %d", p, i);
+                    if (UniqueESSPops[p] == popint){
+                        count++;
+                        fprintf(stderr, "\n input %d is not unique", i);
+                    }
+                }
+                if (count == 0){
+                    fprintf(stderr, "\n input %d is unique", i);
+                    UniqueESSPops[Unique] = popint; //add it to the ESSpops
+                    Unique = Unique + 1;
+                }}
+            for (k = 0; k < essParsDim; k++)
+            {
+                if (popint != essPopsIndex[k]) //checks if all ESS parameters belonf to the same populalation
+                {
+                    fprintf(stderr, "\nNB: ESS will be classified but parameters at ESS value pertain to different populations!\n\n");
+                    classifyESS = 1;
+                }
+                if ((tmpint == essParsIndex[k]) || (tmpint == Bifparone))
+                    error("\nParameter at ESS value (%d) can not be specified twice or equal to bifurcation parameter!\n\n", tmpint);
+            }}
+        if (CurveType == EBPC) { //NEW
+            if (i == 2) {
+                classifyESS = 1; //CHANGE TO 1 if this works
+                UniqueESSPops[0] = popint;
+                
+            }  else if (i > 2 & Unique < maxESS) {  //GET THE NUMBER OF EVOLVING POPULATIONS
+                int count = 0;
+                for (p = 0; p < Unique; p++) {
+                    if (UniqueESSPops[p] == popint){
+                        count++;
+                    }
+                }
+                if (count == 0){
+                    UniqueESSPops[Unique] = popint;
+                    Unique = Unique + 1;
+                }
+            }
+            for (k = 0; k < essParsDim; k++)
+            {
+                if (popint != essPopsIndex[k]) //checks if all ESS parameters belonf to the same populalation
+                {
+                    fprintf(stderr, "\nNB: ESS will be classified but parameters at ESS value pertain to different populations!\n\n");
+                    classifyESS = 1;
+                }
+                if ((tmpint == essParsIndex[k]) || (tmpint == Bifparone))
+                    error("\nParameter at ESS value (%d) can not be specified twice or equal to bifurcation parameter!\n\n", tmpint);
+            }
+        }
+        essPopsIndex[essParsDim] = popint; //vector with all populations that have a parameter in the ESS
+        essParsIndex[essParsDim] = tmpint; //vector with all parameters that are in the ess
+        pntmin[pntdim] = minval; //Vector with all minimum values, including the one of the bif par
+        pntmax[pntdim] = maxval; //Vector with all minimum values, including the one of the bif par
+        essParsDim++;  //dimension of ESSpars
+        pntdim++;  //dimension of the curves.
+    }
+   
+   
+    
+ for (i = 0; i < Unique; i++) {
+ for(j=0, k = 0; j < essParsDim; j++) { //go through all the esspars
+  if(UniqueESSPops[i] == essPopsIndex[j]){ //find the corresponding pop
+      EvoParsSinglePop[i][k+1] = essParsIndex[j]; //Get the index of the esspars
+      k++; //calculate how many ess pars for this evolving pop
+  }}
+      EvoParsSinglePop[i][0] = k;
+     if(CurveType == EBPC){
+         if(UniqueESSPops[i] == EBPIndex){
+             popEBP_index = i;
+         }
+     }
+ }
+    //NEW to calc ess for multiple pop//
+    if(CurveType == ESS) {
+        for (i = 0; i < Unique; i++) {
+            fprintf(stderr, "\t For population %d, the ess pars (%d in total) are:", UniqueESSPops[i], EvoParsSinglePop[i][0]);
+            for(j = 1; j<=EvoParsSinglePop[i][0]; j++){
+            fprintf(stderr, "\t %d",EvoParsSinglePop[i][j]);
+        }
+        }
+    }
+    //NEW continuation of R0_yy=0//
+    if(CurveType == EBPC) {
+        fprintf(stderr, "\t BifPAR 1: %d, BifPar2: %d, First EBPPar: %d \n\n", Bifparone, Bifpartwo,
+                EvoParsSinglePop[popEBP_index][1]);
+        for (i = 0; i < Unique; i++) {
+            fprintf(stderr, "\t For population %d, the ess pars (%d in total) are:", UniqueESSPops[i], EvoParsSinglePop[i][0]);
+            for(j = 1; j<=EvoParsSinglePop[i][0]; j++){
+            fprintf(stderr, "\t %d",EvoParsSinglePop[i][j]);
+        }
+        }
+        fprintf(stderr, "\n\n");
+    }
+    
+  if (ncols)
+    {
+      strcpy(curvestring, "c(");
+      for (i = 0; i < ncols; i++)
+        {
+          if (i) strcat(curvestring, ", ");
+          sprintf(tmpstr, "%.6G", REAL(curveVals)[i]);
+          strcat(curvestring, tmpstr);
+        }
+      strcat(curvestring, ")");
+    }
+  else
+    strcpy(curvestring, "NULL");
+
+  //============== Now curve type and bifurcation parameters are known process the ParEVOIndex and PopEVOIndex arrays ================
+
+  if ((CurveType == EQ) || (CurveType == ESS) || (CurveType == EBPC)) //new (only addition of curvetype ebpc
+    {
+      if ((parevonr == 0) && popevonr)
+        {
+          // warning("\nOption 'popEVO' specified without corresponding 'parEVO' option. Option 'parEVO' defaults to bifurcation parameter (%d)!\n\n", Bifparone);
+          ParEVOIndex[0] = Bifparone;
+          ParEVODim = 1;
+        }
+      else ParEVODim = parevonr;
+      if (popevonr < ParEVODim)
+        warning("\nFewer 'popEVO' than 'parEVO' options specified. Last %d evolutionary parameters assumed to pertain to population 0!\n\n", (ParEVODim - popevonr));
+      else if (popevonr > ParEVODim)
+        warning("\nMore 'popEVO' than 'parEVO' options specified. Last %d 'popEVO' options ignored!\n\n", (popevonr - ParEVODim));
+      for (i = popevonr;  i < ParEVODim;    i++) PopEVOIndex[i]  = 0;
+      for (i = ParEVODim; i < ParameterNr;  i++) PopEVOIndex[i]  = -1;
+    }
+  else
+    {
+      for (i = 0; i < ParameterNr; i++) PopEVOIndex[i] = -1;
+      for (i = 0; i < ParameterNr; i++) ParEVOIndex[i] = -1;
+      ParEVODim = 0;
+    }
+
+  //============================== Process the initial point argument ================================================================
+
+  memset((void *)initpnt, 0, pntdim*sizeof(double));
+  ncols = length(initVals);
+  if (!isReal(initVals) || (ncols != pntdim))
+    {
+      strcpy(varstr, "c( Par.1");
+      for (i = 0; i < EnvironDim; i++)
+        {
+          if (CurveType == BPE)
+            {
+              if ((i == EnvBPIndex) || (EnvTrivEqui[i])) continue;
+            }
+          else if (EnvTrivEqui[i])
+            continue;
+          sprintf(tmpstr, " E[%d]", (int)i);
+          strcat(varstr, tmpstr);
+        }
+      for (i = 0; i < PopulationNr; i++)
+        {
+          if (CurveType == BP)
+            {
+              if ((i == PopBPIndex) || (PopTrivEqui[i])) continue;
+            }
+          else if (PopTrivEqui[i])
+            continue;
+          sprintf(tmpstr, " b[%d]", (int)i);
+          strcat(varstr, tmpstr);
+        }
+      if (!(CurveType == EQ)) strcat(varstr, " Par.2");
+      strcat(varstr, " )");
+      error("\nInitial point for bifurcation must be a row vector of length %d:  %s\n\n", pntdim, varstr);
+    }
+  memcpy(initpnt, REAL(initVals), ncols*sizeof(double));
+  parameter[Bifparone] = initpnt[0];
+
+  if ((CurveType == BP) || (CurveType == LP) || (CurveType == BPE))
+    parameter[Bifpartwo] = initpnt[pntdim - 1];
+  else if (CurveType == ESS)
+    {
+      for (j = 0; j < essParsDim; j++) parameter[essParsIndex[j]] = initpnt[pntdim - essParsDim + j];
+    }
+  else if (CurveType == EBPC)
+      parameter[Bifpartwo] = initpnt[pntdim - 1 - essParsDim];
+  {
+      for (j = 0; j < essParsDim; j++) {
+          parameter[essParsIndex[j]] = initpnt[pntdim - essParsDim + j];
+      }
+  }
+    
+  strcpy(pntstring, "c(");
+  for (i = 0; i < ncols; i++)
+    {
+      if (i) strcat(pntstring, ", ");
+      sprintf(tmpstr, "%.6G", initpnt[i]);
+      strcat(pntstring, tmpstr);
+    }
+  strcat(pntstring, ")");
+
+  //============================= Get the program name ===============================================================================
+  // Get the name of the module file
+  if (isString(moduleName) && (length(moduleName) == 1))
+    strcpy(progname, CHAR(STRING_ELT(moduleName, 0)));
+  else
+    error("\nModel name argument must be a single string\n\n");
+
+  // call the computational routine
+  ComputeCurve(0, NULL);
+
+  if (biffile) fclose(biffile);
+  if (errfile) fclose(errfile);
+  if (outfile) fclose(outfile);
+
+  ResetCurve();
+  FreeHeapMemory();
+
+#if (RFUNCTIONS == 1)
+  Rinterface_End();
+#endif
+
+  PROTECT(resfil = mkString(runname));
+
+  UNPROTECT(1);
+
+  return resfil;
+}
+
+
+/*==================================================================================================================================*/
+#endif
